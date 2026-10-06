@@ -110,6 +110,14 @@ TTL 衰减、到达时 ttl 为零仍送达、起终点相同时立即送达、`n
 
 成功或业务丢弃时输出一行紧凑 JSON，顶层字段及顺序与 `trace` 相同（`status`、`packet_id`、`source`、`destination`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`）；每个实际跳的字段依次为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `fragment_forward`）、`mtu_bytes`、`payload_bytes`、`fragment_count`、`last_fragment_bytes`，其中前 `fragment_count` 减一片的长度均等于 `mtu_bytes`，最后一片长度由 `last_fragment_bytes` 给出。相同输入逐字节一致，不读墙上时钟；设实际跳数为 H、载荷字节数为 P，时间上界为 O((N+M)log(N+M)+P+H)，额外内存为 O(N+M+P+H)，不按分片数展开输出。既有十个命令的输入、输出、错误分类、退出码和帮助行为保持不变。
 
+### `damped-event-trace --input PATH`
+
+在 `event-trace` 的根字段之外仅增加 `hold_down_ms` 一个字段（根对象共八个字段，拒绝其他字段）。`hold_down_ms` 是 0 至 86400000.000 的十进制毫秒字符串，最多三位小数，格式规则与 `clock_ms` 相同，不接受指数、符号、空白和非有限值；`clock_ms` 与 `events` 沿用 `event-trace` 的全部规则。根字段错误、非法时间、事件乱序或未知链路均输出 `ConfigError`（退出码 3），标准输出为空；端点与报文错误仍为 `ParameterError`（2）与 `PacketError`（4）。拓扑、端点、报文、时钟、稳定等待期和全部事件完整校验后才开始回放。
+
+回放只观察 `at_ms` 不晚于 `clock_ms` 的事件；查询时刻之后的事件不生效，也不影响此前事件。同一链路的事件在 `at_ms` 加 `hold_down_ms` 后生效；若输入中更晚的同链路事件早于该生效时刻，前一事件被抑制，即使 `up` 值相同也重新等待；后续事件恰好位于生效时刻时不抑制前者，同一时刻按输入顺序处理；`hold_down_ms` 为零时，全部已到达事件立即按原顺序生效。有效拓扑从 `links` 的初始 `up` 状态开始，仅应用已完成等待的事件，再沿用 `trace` 的确定性最小代价选路、平局处理、TTL 衰减、立即送达、`no_route` 与 `ttl_exhausted` 语义；应用事件不消耗 ttl，不读墙上时钟。跳数上限仍为节点数减一，处理 E 个事件的额外时间和内存均为 O(E)，总时间上界 O(E+(N+M)log(N+M))。
+
+成功或业务丢弃时输出一行紧凑 JSON，顶层键依次为 `status`、`packet_id`、`source`、`destination`、`clock_ms`、`hold_down_ms`、`effective_events`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`。`clock_ms`、`hold_down_ms` 与事件时间统一补足三位小数；`effective_events` 仅列真正生效的事件并按生效顺序排列，每项键依次为 `at_ms`、`effective_at_ms`、`link`、`up`，生效值与当前状态相同也记录；每个 hop 的键序为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `damped_event_route`）。同一输入逐字节一致。既有十一个命令的输入、输出、错误和键序保持不变。
+
 ## 状态
 
 仓库初始为空，功能按增量需求持续构建。

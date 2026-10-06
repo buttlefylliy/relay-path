@@ -15,6 +15,7 @@ Public entry points:
     python relay_path.py event-trace --input PATH
     python relay_path.py node-event-trace --input PATH
     python relay_path.py fragment-trace --input PATH
+    python relay_path.py damped-event-trace --input PATH
 
 Reads a UTF-8 JSON object describing relay nodes and directed links and
 prints the minimum-cost route from source to destination (route), the
@@ -39,7 +40,10 @@ replays node failure and recovery events against an explicit event
 clock and forwards the packet over the effective topology at the
 query time (node-event-trace), or a trace that slices the reassembled
 payload into MTU-sized fragments before every successful link
-departure and reassembles at the next node (fragment-trace), as one
+departure and reassembles at the next node (fragment-trace), or a
+trace that lets every link event take effect only after a hold-down
+wait, suppressing events that are overtaken by a later event for the
+same link before their wait completes (damped-event-trace), as one
 compact JSON object on stdout.
 """
 
@@ -76,6 +80,7 @@ QUEUE_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + (
 EVENT_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("clock_ms", "events")
 NODE_EVENT_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("clock_ms", "events")
 FRAGMENT_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("mtus",)
+DAMPED_EVENT_TRACE_ROOT_FIELDS = EVENT_TRACE_ROOT_FIELDS + ("hold_down_ms",)
 PACKET_FIELDS = ("id", "ttl", "priority", "payload")
 STICKY_PACKET_FIELDS = PACKET_FIELDS + ("flow_id",)
 TIME_PATTERN = re.compile(r"[0-9]+(\.[0-9]{1,3})?\Z")
@@ -651,6 +656,63 @@ errors (single compact JSON line on stderr, keys: error, message):
   PacketError (exit code 4) as in trace; invalid mtus are a
   ConfigError; stdout is left empty. All validation completes before
   any tracing begins.
+"""
+
+DAMPED_EVENT_HELP = """\
+input format (UTF-8 JSON object with exactly these eight fields):
+  nodes, links, source, destination, packet
+              exactly as in the trace command; every topology and
+              packet constraint applies unchanged
+  clock_ms    decimal millisecond string in
+              0..999999999999.999 with at most three fractional
+              digits, exactly as in the latency-trace command
+  events      array of at most 100000 objects, exactly as in the
+              event-trace command: each has the fields at_ms, link
+              and up, ordered by non-decreasing at_ms
+  hold_down_ms
+              decimal millisecond string in 0..86400000.000 with at
+              most three fractional digits: the stability wait every
+              link event must complete before it takes effect
+
+forwarding rules:
+  every link starts in its declared up state. Only events with at_ms
+  less than or equal to clock_ms are observed; later events never
+  take effect and never influence earlier events. An observed event
+  takes effect at at_ms + hold_down_ms; a later observed event for
+  the same link that arrives strictly before that moment suppresses
+  it and restarts the wait, even when the up value is equal, while an
+  event arriving exactly at that moment does not. Events at the same
+  time are processed in input order, and a zero hold_down_ms lets
+  every observed event take effect immediately in input order.
+  Surviving events whose effective time is not later than clock_ms
+  apply in input order over the declared link states; the packet then
+  follows the same deterministic minimum-cost route as the trace
+  command over the effective topology, with the same ttl, immediate
+  delivery, no_route and ttl_exhausted semantics as event-trace.
+  Applying events consumes no ttl and never reads the wall clock. At
+  most (node count - 1) hops are possible.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, packet_id, source, destination, clock_ms, hold_down_ms,
+  effective_events, path, hops, final_node, ttl_remaining, reason
+  status is "delivered" (reason null) or "dropped" (reason is the
+  unique drop cause). clock_ms and hold_down_ms carry exactly three
+  fractional digits. effective_events lists only the events that
+  actually took effect, in the order they took effect, each with keys
+  at_ms, effective_at_ms, link, up in this order and both times
+  rendered with exactly three fractional digits; an event whose
+  effective value equals the current state is still recorded. path
+  lists the nodes actually reached; each hop has keys from, to, link,
+  ttl_before, ttl_after, decision in this order, and decision is
+  always "damped_event_route".
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3), ParameterError (exit code 2) and
+  PacketError (exit code 4) as in trace; a malformed clock_ms or
+  hold_down_ms or any malformed, misordered, misreferencing or
+  over-limit event is a ConfigError; stdout is left empty. All
+  validation completes before any event is applied or any tracing
+  begins.
 """
 
 
@@ -2088,6 +2150,134 @@ def node_event_trace_packet(
     return output
 
 
+def apply_damped_events(links, events, clock_thousandths, hold_thousandths):
+    """Replay link events with a hold-down wait before each takes effect.
+
+    Only events with at_ms less than or equal to clock_thousandths are
+    observed; later events never take effect and never suppress earlier
+    ones. An observed event would take effect at at_ms + hold_down_ms;
+    it is suppressed when a later observed event for the same link
+    arrives strictly before that moment (the wait restarts even for an
+    equal up value), while an event arriving exactly at that moment
+    does not suppress it. Surviving events whose effective time is not
+    later than clock_thousandths apply in input order over the declared
+    link states. Returns (effective links, effective events), where
+    effective links are (id, u, v, cost, up) tuples in the declared
+    link order and effective events are {"at_ms", "effective_at_ms",
+    "link", "up"} objects in the order they take effect, with times
+    rendered to three fractional digits.
+    """
+    observed = [event for event in events if event[0] <= clock_thousandths]
+    suppressed = [False] * len(observed)
+    next_at = {}
+    for index in range(len(observed) - 1, -1, -1):
+        at, link_id, _up = observed[index]
+        later = next_at.get(link_id)
+        if later is not None and later < at + hold_thousandths:
+            suppressed[index] = True
+        next_at[link_id] = at
+
+    state = {link_id: up for link_id, _u, _v, _cost, up in links}
+    effective_events = []
+    for (at, link_id, up), is_suppressed in zip(observed, suppressed):
+        if is_suppressed:
+            continue
+        effective_at = at + hold_thousandths
+        if effective_at > clock_thousandths:
+            continue
+        state[link_id] = up
+        effective_events.append(
+            {
+                "at_ms": format_ms(at),
+                "effective_at_ms": format_ms(effective_at),
+                "link": link_id,
+                "up": up,
+            }
+        )
+    effective = [
+        (link_id, u, v, cost, state[link_id])
+        for link_id, u, v, cost, _up in links
+    ]
+    return effective, effective_events
+
+
+def damped_event_trace_packet(
+    node_ids, links, source, destination, packet_id, ttl,
+    clock_thousandths, hold_thousandths, events,
+):
+    """Replay link events with a hold-down wait, then forward a packet
+    along the deterministic minimum-cost route of the effective
+    topology.
+
+    Links start in their declared up state, every observed event takes
+    effect only after hold_down_ms unless a later same-link event
+    suppresses it first, and routing, ttl and drop attribution are
+    exactly as in trace_packet over the resulting topology. Applying
+    events consumes no ttl and never reads the wall clock.
+
+    Returns the output object with keys status, packet_id, source,
+    destination, clock_ms, hold_down_ms, effective_events, path, hops,
+    final_node, ttl_remaining, reason. Every hop carries keys from, to,
+    link, ttl_before, ttl_after, decision, with decision
+    "damped_event_route".
+    """
+    effective_links, effective_events = apply_damped_events(
+        links, events, clock_thousandths, hold_thousandths
+    )
+
+    source_id = node_ids[source]
+    destination_id = node_ids[destination]
+    output = {
+        "status": None,
+        "packet_id": packet_id,
+        "source": source_id,
+        "destination": destination_id,
+        "clock_ms": format_ms(clock_thousandths),
+        "hold_down_ms": format_ms(hold_thousandths),
+        "effective_events": effective_events,
+        "path": [source_id],
+        "hops": [],
+        "final_node": source_id,
+        "ttl_remaining": ttl,
+        "reason": None,
+    }
+
+    if source == destination:
+        output["status"] = "delivered"
+        return output
+
+    route = find_route(node_ids, effective_links, source, destination)
+    if route is None:
+        output["status"] = "dropped"
+        output["reason"] = "no_route"
+        return output
+
+    path, route_links, _total_cost = route
+    remaining = ttl
+    for next_id, link_id in zip(path[1:], route_links):
+        if remaining <= 0:
+            output["status"] = "dropped"
+            output["reason"] = "ttl_exhausted"
+            output["ttl_remaining"] = remaining
+            return output
+        hop = {
+            "from": output["final_node"],
+            "to": next_id,
+            "link": link_id,
+            "ttl_before": remaining,
+            "ttl_after": remaining - 1,
+            "decision": "damped_event_route",
+        }
+        output["hops"].append(hop)
+        remaining -= 1
+        output["path"].append(next_id)
+        output["final_node"] = next_id
+
+    output["status"] = "delivered"
+    output["ttl_remaining"] = remaining
+    return output
+
+
 def ecmp_candidate_table(node_ids, links, destination):
     """Minimum-cost candidate next hops for every node, keyed by distance.
 
@@ -2669,6 +2859,26 @@ def build_parser():
         metavar="PATH",
         help="path to the UTF-8 JSON fragment trace document",
     )
+    damped_event_parser = subparsers.add_parser(
+        "damped-event-trace",
+        help="replay link events with a hold-down wait, then trace",
+        description=(
+            "Replay link failure and recovery events against an "
+            "explicit event clock, letting every event take effect "
+            "only after a hold-down wait and suppressing events "
+            "overtaken by a later event for the same link, then trace "
+            "a packet hop by hop over the effective topology at the "
+            "query time."
+        ),
+        epilog=DAMPED_EVENT_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    damped_event_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON damped event trace document",
+    )
     return parser
 
 
@@ -2885,6 +3095,33 @@ def main(argv):
                 ttl,
                 payload,
                 link_mtus,
+            )
+            write_json_line(sys.stdout, output)
+            return 0
+        if args.command == "damped-event-trace":
+            node_ids, links, source, destination = validate(
+                document, DAMPED_EVENT_TRACE_ROOT_FIELDS
+            )
+            packet_id, ttl, _priority, _payload = validate_packet(document)
+            clock_thousandths = parse_time_value(
+                document["clock_ms"], MAX_CLOCK_THOUSANDTHS, "clock_ms"
+            )
+            hold_thousandths = parse_time_value(
+                document["hold_down_ms"],
+                MAX_LINK_LATENCY_THOUSANDTHS,
+                "hold_down_ms",
+            )
+            events = validate_events(document, [link[0] for link in links])
+            output = damped_event_trace_packet(
+                node_ids,
+                links,
+                source,
+                destination,
+                packet_id,
+                ttl,
+                clock_thousandths,
+                hold_thousandths,
+                events,
             )
             write_json_line(sys.stdout, output)
             return 0
