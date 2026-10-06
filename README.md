@@ -110,13 +110,21 @@ TTL 衰减、到达时 ttl 为零仍送达、起终点相同时立即送达、`n
 
 成功或业务丢弃时输出一行紧凑 JSON，顶层键依次为 `status`、`packet_id`、`source`、`destination`、`clock_ms`、`applied_events`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`。`clock_ms` 与事件时间统一补足三位小数；`applied_events` 只列实际应用的事件并保持输入顺序，每项键依次为 `at_ms`、`node`、`up`；每个 hop 的键序为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `node_event_route`）。同一输入逐字节一致。既有十个命令的输入、输出、错误和键序保持不变。
 
+### `topology-event-trace --input PATH`
+
+在 `trace` 的根字段之外仅增加 `clock_ms` 与 `events` 两个字段（根对象共七个字段，拒绝其他字段）。`clock_ms` 沿用 `latency-trace` 的规则：0 至 999999999999.999 的十进制毫秒字符串，最多三位小数，不接受指数、符号、空白和非有限值。`events` 是最多 100000 项的数组，每项只含 `at_ms`（与 `clock_ms` 同规则同范围的毫秒字符串）、`target_type`（只能为 JSON 字符串 `link` 或 `node`）、`target`（字符串；`target_type` 为 `link` 时必须引用已声明链路，为 `node` 时必须引用已声明节点）、`up`（必须是 JSON 布尔值）；事件按 `at_ms` 非递减排列，同一时刻按数组顺序处理，允许对同一目标重复设置及随后恢复。时钟或事件的结构、次序、类型、时间、引用或数量非法均输出 `ConfigError`（退出码 3），标准输出为空；拓扑、端点、报文错误仍为 `ConfigError`（3）、`ParameterError`（2）、`PacketError`（4）。拓扑、端点、报文、时钟和全部事件完整校验后才开始计算。
+
+各节点初始均可用，各链路从声明的初始 `up` 状态开始；只处理 `at_ms` 小于或等于 `clock_ms` 的事件，晚于查询时刻的合法事件不生效，已到达事件按数组顺序依次覆盖对应状态。节点事件只设置节点可用性，链路事件只覆盖链路自身状态：节点不可用时其全部入链和出链均不参与选路，但不改写链路状态；节点恢复后，链路仍服从最后一次链路事件（无则为声明的初始 `up`）。查询时刻 source 或 destination 不可用时，报文在 source 以 `node_down` 丢弃：`path` 仅含 source、`hops` 为空、`final_node` 为 source 且 ttl 不变；该判定优先于 source 等于 destination。否则在查询时刻的有效拓扑上沿用 `trace` 的最小代价选路、平局处理、TTL 衰减、立即送达、`no_route` 与 `ttl_exhausted` 语义；处理事件不消耗 ttl，不读墙上时钟。跳数上限仍为节点数减一，处理 E 个事件的额外时间和内存均为 O(E)，总时间上界 O(E+(N+M)log(N+M))。
+
+成功或业务丢弃时输出一行紧凑 JSON，顶层键依次为 `status`、`packet_id`、`source`、`destination`、`clock_ms`、`applied_events`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`。`clock_ms` 与事件时间统一补足三位小数；`applied_events` 只含已生效事件且顺序不变，每项键依次为 `at_ms`、`target_type`、`target`、`up`；每个 hop 的键序为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `topology_event_route`）。同一输入逐字节一致。既有十一个命令的输入、输出、错误和键序保持不变。
+
 ### `fragment-trace --input PATH`
 
 在 `trace` 的根字段之外仅增加 `mtus` 一个字段（根对象共六个字段，拒绝其他字段）。`mtus` 是对象，键必须恰好覆盖全部已声明链路且不重复，值只能是 1 到 65536 的 JSON 整数，布尔值不得充当整数。缺少链路、未知链路、重复 JSON 键或越界值均输出 `ConfigError`（退出码 3）；端点与报文错误仍为 `ParameterError`（2）与 `PacketError`（4），错误时标准输出为空。拓扑、端点、报文与全部 MTU 完整校验后才开始追踪，MTU 不参与选路。
 
 报文仍沿 `trace` 的确定性最小代价路径逐跳转发，路径、TTL 与丢弃归因不因 MTU 改变。每次成功离开节点前，把 `packet.payload` 的 UTF-8 字节序列视为已重组的完整载荷，再按所选链路 MTU 从前到后切片：除最后一片外均为 MTU 字节，最后一片承载余数，字节数恰好整除时最后一片也是 MTU 字节，空载荷固定为一个长度为零的空分片。不输出或解码分片内容，允许在多字节字符内部切分。分片不额外消耗 TTL，也不改变路径；到下一节点后重新组装，后续链路再按自身 MTU 分片。TTL 为零、无路可达、起终点相同和到达时 TTL 恰为零的处理沿用 `trace`，未尝试链路（立即送达、`no_route`、`ttl_exhausted`）不产生分片记录。
 
-成功或业务丢弃时输出一行紧凑 JSON，顶层字段及顺序与 `trace` 相同（`status`、`packet_id`、`source`、`destination`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`）；每个实际跳的字段依次为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `fragment_forward`）、`mtu_bytes`、`payload_bytes`、`fragment_count`、`last_fragment_bytes`，其中前 `fragment_count` 减一片的长度均等于 `mtu_bytes`，最后一片长度由 `last_fragment_bytes` 给出。相同输入逐字节一致，不读墙上时钟；设实际跳数为 H、载荷字节数为 P，时间上界为 O((N+M)log(N+M)+P+H)，额外内存为 O(N+M+P+H)，不按分片数展开输出。既有十一个命令的输入、输出、错误分类、退出码和帮助行为保持不变。
+成功或业务丢弃时输出一行紧凑 JSON，顶层字段及顺序与 `trace` 相同（`status`、`packet_id`、`source`、`destination`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`）；每个实际跳的字段依次为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `fragment_forward`）、`mtu_bytes`、`payload_bytes`、`fragment_count`、`last_fragment_bytes`，其中前 `fragment_count` 减一片的长度均等于 `mtu_bytes`，最后一片长度由 `last_fragment_bytes` 给出。相同输入逐字节一致，不读墙上时钟；设实际跳数为 H、载荷字节数为 P，时间上界为 O((N+M)log(N+M)+P+H)，额外内存为 O(N+M+P+H)，不按分片数展开输出。既有十二个命令的输入、输出、错误分类、退出码和帮助行为保持不变。
 
 ## 状态
 
