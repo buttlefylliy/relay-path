@@ -9,6 +9,7 @@ Public entry points:
     python relay_path.py weighted-ecmp-trace --input PATH
     python relay_path.py sticky-ecmp-trace --input PATH
     python relay_path.py latency-trace --input PATH
+    python relay_path.py loss-trace --input PATH
 
 Reads a UTF-8 JSON object describing relay nodes and directed links and
 prints the minimum-cost route from source to destination (route), the
@@ -19,8 +20,10 @@ weighted equal-cost next hop using per-link weights
 (weighted-ecmp-trace), or a trace that keeps every packet of one flow on
 the highest-scoring equal-cost next hop (sticky-ecmp-trace), or a trace
 that annotates every hop of the deterministic minimum-cost route with
-departure, link-latency and arrival times (latency-trace), as one
-compact JSON object on stdout.
+departure, link-latency and arrival times (latency-trace), or a trace
+that drops the packet on a link when a deterministic per-hop hash falls
+below that link's configured loss rate (loss-trace), as one compact
+JSON object on stdout.
 """
 
 import argparse
@@ -45,9 +48,12 @@ ROOT_FIELDS = ("nodes", "links", "source", "destination")
 TRACE_ROOT_FIELDS = ROOT_FIELDS + ("packet",)
 WEIGHTED_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("weights",)
 LATENCY_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("clock_ms", "latencies")
+LOSS_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("loss_rates",)
 PACKET_FIELDS = ("id", "ttl", "priority", "payload")
 STICKY_PACKET_FIELDS = PACKET_FIELDS + ("flow_id",)
 TIME_PATTERN = re.compile(r"[0-9]+(\.[0-9]{1,3})?\Z")
+LOSS_RATE_PATTERN = re.compile(r"(0\.[0-9]{6}|1\.0{6})\Z")
+MAX_LOSS_UNITS = 1000000
 
 FORMAT_HELP = """\
 input format (UTF-8 JSON object with exactly these four fields):
@@ -293,6 +299,55 @@ output (single compact JSON line on stdout, keys in this order):
   departed_at_ms, latency_ms, arrived_at_ms in this order, and
   decision is always "forward". All times are decimal millisecond
   strings with exactly three fractional digits.
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3), ParameterError (exit code 2) and
+  PacketError (exit code 4) as in trace; stdout is left empty. All
+  validation completes before any tracing begins.
+"""
+
+LOSS_HELP = """\
+input format (UTF-8 JSON object with exactly these six fields):
+  nodes, links, source, destination, packet
+              exactly as in the trace command; every topology and
+              packet constraint applies unchanged
+  loss_rates  object whose keys are declared link ids and whose
+              values are decimal strings in 0.000000..1.000000 with
+              exactly six fractional digits; links not listed default
+              to 0.000000. Unknown link keys, non-string values,
+              malformed strings and out-of-range rates are
+              ConfigErrors.
+
+forwarding rules:
+  the packet follows the same deterministic minimum-cost route as the
+  trace command; loss rates never influence the path. Before every
+  link attempt, SHA-256 is computed over the UTF-8 bytes of packet.id,
+  one zero byte, the UTF-8 bytes of the link id, one zero byte, and
+  the decimal ASCII bytes of the zero-based hop index; the first eight
+  digest bytes are read as a big-endian unsigned integer loss_value.
+  The loss rate is converted to an integer count of millionths
+  loss_units; the attempt is lost exactly when
+  loss_value * 1000000 < loss_units * 2**64, so a rate of zero never
+  loses and a rate of one always loses. No randomness or wall clock is
+  used. A ttl of zero before forwarding still drops the packet at the
+  current node with reason ttl_exhausted and no digest is computed;
+  every actual attempt consumes one ttl. A lost attempt is recorded in
+  hops, but its target node is not added to path, final_node stays at
+  the sending node, and the trace stops with status dropped and reason
+  link_loss. Arriving at the destination with ttl reduced to zero
+  still counts as delivered; no_route, source equal to destination and
+  the (node count - 1) hop bound are as in trace.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, packet_id, source, destination, path, hops, final_node,
+  ttl_remaining, reason
+  status is "delivered" (reason null) or "dropped" (reason is the
+  unique drop cause). path lists the nodes actually reached; each hop
+  has keys from, to, link, ttl_before, ttl_after, decision, loss_rate,
+  loss_value in this order; decision is "forward" for a successful
+  attempt and "drop_loss" for a lost one, loss_rate is the link's rate
+  with exactly six fractional digits, and loss_value is the digest
+  prefix as 16 lowercase hexadecimal characters.
 
 errors (single compact JSON line on stderr, keys: error, message):
   ConfigError (exit code 3), ParameterError (exit code 2) and
@@ -630,6 +685,48 @@ def validate_latencies(document, link_ids):
     return resolved
 
 
+def validate_loss_rates(document, link_ids):
+    """Validate the loss_rates field; every problem is a ConfigError.
+
+    Keys must refer to declared link ids and values must be decimal
+    strings in 0.000000..1.000000 with exactly six fractional digits.
+    Keys are checked in Unicode code point order so the first reported
+    problem is deterministic. Links absent from the object default to
+    0.000000. Returns a mapping of link id to loss rate as an integer
+    count of millionths containing only explicitly listed links.
+    """
+    loss_rates = document["loss_rates"]
+    if not isinstance(loss_rates, dict):
+        raise ConfigError("loss_rates must be an object")
+
+    declared = set(link_ids)
+    resolved = {}
+    for link_id in sorted(loss_rates):
+        if not isinstance(link_id, str):
+            raise ConfigError("loss_rates keys must be strings")
+        if link_id not in declared:
+            raise ConfigError(
+                "loss_rates refers to an undeclared link: %s" % link_id
+            )
+        value = loss_rates[link_id]
+        where = "loss_rates[%s]" % link_id
+        if not isinstance(value, str):
+            raise ConfigError("%s must be a decimal loss rate string" % where)
+        if LOSS_RATE_PATTERN.match(value) is None:
+            raise ConfigError(
+                "%s must be in 0.000000..1.000000 with exactly six"
+                " fractional digits" % where
+            )
+        integer, _dot, fraction = value.partition(".")
+        resolved[link_id] = int(integer) * MAX_LOSS_UNITS + int(fraction)
+    return resolved
+
+
+def format_loss_rate(loss_units):
+    """Render a millionths loss rate with exactly six decimals."""
+    return "%d.%06d" % (loss_units // MAX_LOSS_UNITS, loss_units % MAX_LOSS_UNITS)
+
+
 def shortest_distances(node_count, adjacency, source):
     """Plain Dijkstra over positive-cost directed edges."""
     dist = [None] * node_count
@@ -841,6 +938,104 @@ def latency_trace_packet(
     output["status"] = "delivered"
     output["ttl_remaining"] = remaining
     output["finished_at_ms"] = format_ms(now)
+    return output
+
+
+def loss_hash_value(packet_id, link_id, hop_index):
+    """First eight digest bytes of the per-attempt loss hash, as an int.
+
+    SHA-256 over the UTF-8 bytes of packet.id, one zero byte, the UTF-8
+    bytes of the link id, one zero byte, and the decimal ASCII bytes of
+    the zero-based hop index; the first eight digest bytes are read as
+    a big-endian unsigned integer.
+    """
+    digest = hashlib.sha256()
+    digest.update(packet_id.encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(link_id.encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(str(hop_index).encode("ascii"))
+    return int.from_bytes(digest.digest()[:8], "big")
+
+
+def loss_trace_packet(
+    node_ids, links, source, destination, packet_id, ttl, link_loss_units
+):
+    """Forward a packet along the deterministic minimum-cost route,
+    losing each link attempt when its deterministic hash falls below
+    the link's configured loss rate.
+
+    Routing, ttl and drop attribution are exactly as in trace_packet;
+    loss rates never influence the path. An attempt on a link is lost
+    exactly when loss_value * 1000000 < loss_units * 2**64, where
+    loss_value is loss_hash_value for that attempt and loss_units the
+    link's rate in millionths (default zero). A lost attempt is
+    recorded in hops and consumes one ttl, but its target node is not
+    added to path, final_node stays at the sending node, and the trace
+    stops with reason link_loss.
+
+    Returns the output object with keys status, packet_id, source,
+    destination, path, hops, final_node, ttl_remaining, reason. Every
+    hop carries keys from, to, link, ttl_before, ttl_after, decision,
+    loss_rate, loss_value, with decision "forward" or "drop_loss".
+    """
+    source_id = node_ids[source]
+    destination_id = node_ids[destination]
+    output = {
+        "status": None,
+        "packet_id": packet_id,
+        "source": source_id,
+        "destination": destination_id,
+        "path": [source_id],
+        "hops": [],
+        "final_node": source_id,
+        "ttl_remaining": ttl,
+        "reason": None,
+    }
+
+    if source == destination:
+        output["status"] = "delivered"
+        return output
+
+    route = find_route(node_ids, links, source, destination)
+    if route is None:
+        output["status"] = "dropped"
+        output["reason"] = "no_route"
+        return output
+
+    path, route_links, _total_cost = route
+    remaining = ttl
+    for hop_index, (next_id, link_id) in enumerate(zip(path[1:], route_links)):
+        if remaining <= 0:
+            output["status"] = "dropped"
+            output["reason"] = "ttl_exhausted"
+            output["ttl_remaining"] = remaining
+            return output
+        loss_units = link_loss_units.get(link_id, 0)
+        loss_value = loss_hash_value(packet_id, link_id, hop_index)
+        lost = loss_value * MAX_LOSS_UNITS < loss_units << 64
+        hop = {
+            "from": output["final_node"],
+            "to": next_id,
+            "link": link_id,
+            "ttl_before": remaining,
+            "ttl_after": remaining - 1,
+            "decision": "drop_loss" if lost else "forward",
+            "loss_rate": format_loss_rate(loss_units),
+            "loss_value": "%016x" % loss_value,
+        }
+        output["hops"].append(hop)
+        remaining -= 1
+        if lost:
+            output["status"] = "dropped"
+            output["reason"] = "link_loss"
+            output["ttl_remaining"] = remaining
+            return output
+        output["path"].append(next_id)
+        output["final_node"] = next_id
+
+    output["status"] = "delivered"
+    output["ttl_remaining"] = remaining
     return output
 
 
@@ -1321,6 +1516,23 @@ def build_parser():
         metavar="PATH",
         help="path to the UTF-8 JSON latency trace document",
     )
+    loss_parser = subparsers.add_parser(
+        "loss-trace",
+        help="drop a packet on links whose loss hash falls below the rate",
+        description=(
+            "Trace a packet along the deterministic minimum-cost route "
+            "and lose each link attempt when its deterministic hash "
+            "falls below the link's configured loss rate."
+        ),
+        epilog=LOSS_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    loss_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON loss trace document",
+    )
     return parser
 
 
@@ -1409,6 +1621,25 @@ def main(argv):
                 ttl,
                 start_thousandths,
                 link_latencies,
+            )
+            write_json_line(sys.stdout, output)
+            return 0
+        if args.command == "loss-trace":
+            node_ids, links, source, destination = validate(
+                document, LOSS_TRACE_ROOT_FIELDS
+            )
+            packet_id, ttl, _priority, _payload = validate_packet(document)
+            link_loss_units = validate_loss_rates(
+                document, [link[0] for link in links]
+            )
+            output = loss_trace_packet(
+                node_ids,
+                links,
+                source,
+                destination,
+                packet_id,
+                ttl,
+                link_loss_units,
             )
             write_json_line(sys.stdout, output)
             return 0
