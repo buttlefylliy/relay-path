@@ -8,6 +8,7 @@ Public entry points:
     python relay_path.py ecmp-trace --input PATH
     python relay_path.py weighted-ecmp-trace --input PATH
     python relay_path.py sticky-ecmp-trace --input PATH
+    python relay_path.py latency-trace --input PATH
 
 Reads a UTF-8 JSON object describing relay nodes and directed links and
 prints the minimum-cost route from source to destination (route), the
@@ -16,7 +17,9 @@ trace that hashes the packet onto an equal-cost minimum-cost next hop at
 every node (ecmp-trace), or a trace that hashes the packet onto a
 weighted equal-cost next hop using per-link weights
 (weighted-ecmp-trace), or a trace that keeps every packet of one flow on
-the highest-scoring equal-cost next hop (sticky-ecmp-trace), as one
+the highest-scoring equal-cost next hop (sticky-ecmp-trace), or a trace
+that annotates every hop of the deterministic minimum-cost route with
+departure, link-latency and arrival times (latency-trace), as one
 compact JSON object on stdout.
 """
 
@@ -24,6 +27,7 @@ import argparse
 import hashlib
 import heapq
 import json
+import re
 import sys
 
 MAX_NODES = 10000
@@ -34,12 +38,16 @@ MAX_PACKET_PRIORITY = 7
 MAX_PAYLOAD_BYTES = 65536
 MIN_LINK_WEIGHT = 1
 MAX_LINK_WEIGHT = 65535
+MAX_CLOCK_THOUSANDTHS = 999999999999999
+MAX_LINK_LATENCY_THOUSANDTHS = 86400000000
 NODE_TYPES = ("relay", "terminal", "pseudo")
 ROOT_FIELDS = ("nodes", "links", "source", "destination")
 TRACE_ROOT_FIELDS = ROOT_FIELDS + ("packet",)
 WEIGHTED_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("weights",)
+LATENCY_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("clock_ms", "latencies")
 PACKET_FIELDS = ("id", "ttl", "priority", "payload")
 STICKY_PACKET_FIELDS = PACKET_FIELDS + ("flow_id",)
+TIME_PATTERN = re.compile(r"[0-9]+(\.[0-9]{1,3})?\Z")
 
 FORMAT_HELP = """\
 input format (UTF-8 JSON object with exactly these four fields):
@@ -243,6 +251,48 @@ output (single compact JSON line on stdout, keys in this order):
   candidate_count, selected_index, selected_score in this order;
   decision is always "sticky_ecmp_hash", and selected_score is the
   winning candidate's digest as 64 lowercase hexadecimal characters.
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3), ParameterError (exit code 2) and
+  PacketError (exit code 4) as in trace; stdout is left empty. All
+  validation completes before any tracing begins.
+"""
+
+LATENCY_HELP = """\
+input format (UTF-8 JSON object with exactly these seven fields):
+  nodes, links, source, destination, packet
+              exactly as in the trace command; every topology and
+              packet constraint applies unchanged
+  clock_ms    decimal millisecond string in
+              0..999999999999.999 with at most three fractional
+              digits; no exponent, sign, whitespace or non-finite
+              value is accepted
+  latencies   object whose keys are declared link ids and whose
+              values are decimal millisecond strings in
+              0..86400000.000 under the same format rules; links
+              not listed default to 0.000. Unknown link keys and
+              malformed or out-of-range times are ConfigErrors.
+
+forwarding rules:
+  the packet follows the same deterministic minimum-cost route as the
+  trace command; path, ttl and drop attribution never depend on the
+  latencies. Time is accumulated in thousandths of a millisecond and
+  never reads the wall clock. The first hop departs at clock_ms, every
+  later hop departs when the previous hop arrived, and a hop arrives
+  its latency after departing. Immediate delivery, no_route and
+  ttl_exhausted before the first hop finish at the start time;
+  ttl_exhausted later finishes at the last hop's arrival. At most
+  (node count - 1) hops are possible.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, packet_id, source, destination, path, hops, final_node,
+  ttl_remaining, reason, started_at_ms, finished_at_ms
+  status is "delivered" (reason null) or "dropped" (reason is the
+  unique drop cause). path lists the nodes actually reached; each hop
+  has keys from, to, link, ttl_before, ttl_after, decision,
+  departed_at_ms, latency_ms, arrived_at_ms in this order, and
+  decision is always "forward". All times are decimal millisecond
+  strings with exactly three fractional digits.
 
 errors (single compact JSON line on stderr, keys: error, message):
   ConfigError (exit code 3), ParameterError (exit code 2) and
@@ -520,6 +570,66 @@ def validate_weights(document, link_ids):
     return resolved
 
 
+def parse_time_value(value, max_thousandths, where):
+    """Parse a decimal millisecond string into thousandths of a millisecond.
+
+    Only digits with an optional fractional part of one to three digits
+    are accepted: no exponent, sign, whitespace or non-finite value.
+    Every problem is a ConfigError. Returns a non-negative integer count
+    of thousandths of a millisecond, at most max_thousandths.
+    """
+    if not isinstance(value, str):
+        raise ConfigError("%s must be a decimal millisecond string" % where)
+    if TIME_PATTERN.match(value) is None:
+        raise ConfigError(
+            "%s must be a decimal string with at most three fractional"
+            " digits" % where
+        )
+    integer, dot, fraction = value.partition(".")
+    thousandths = int(integer) * 1000
+    if dot:
+        thousandths += int((fraction + "000")[:3])
+    if thousandths > max_thousandths:
+        raise ConfigError("%s is out of range" % where)
+    return thousandths
+
+
+def format_ms(thousandths):
+    """Render thousandths of a millisecond with exactly three decimals."""
+    return "%d.%03d" % (thousandths // 1000, thousandths % 1000)
+
+
+def validate_latencies(document, link_ids):
+    """Validate the latencies field; every problem is a ConfigError.
+
+    Keys must refer to declared link ids and values must be decimal
+    millisecond strings in 0..86400000.000. Keys are checked in Unicode
+    code point order so the first reported problem is deterministic.
+    Links absent from the object default to 0.000. Returns a mapping of
+    link id to latency in thousandths of a millisecond containing only
+    explicitly listed links.
+    """
+    latencies = document["latencies"]
+    if not isinstance(latencies, dict):
+        raise ConfigError("latencies must be an object")
+
+    declared = set(link_ids)
+    resolved = {}
+    for link_id in sorted(latencies):
+        if not isinstance(link_id, str):
+            raise ConfigError("latencies keys must be strings")
+        if link_id not in declared:
+            raise ConfigError(
+                "latencies refers to an undeclared link: %s" % link_id
+            )
+        resolved[link_id] = parse_time_value(
+            latencies[link_id],
+            MAX_LINK_LATENCY_THOUSANDTHS,
+            "latencies[%s]" % link_id,
+        )
+    return resolved
+
+
 def shortest_distances(node_count, adjacency, source):
     """Plain Dijkstra over positive-cost directed edges."""
     dist = [None] * node_count
@@ -651,6 +761,86 @@ def trace_packet(node_ids, links, source, destination, packet_id, ttl):
 
     output["status"] = "delivered"
     output["ttl_remaining"] = remaining
+    return output
+
+
+def latency_trace_packet(
+    node_ids, links, source, destination, packet_id, ttl,
+    start_thousandths, link_latencies,
+):
+    """Forward a packet along the deterministic minimum-cost route,
+    stamping every hop with departure, latency and arrival times.
+
+    Routing, ttl and drop attribution are exactly as in trace_packet;
+    latencies never influence the path. Time is accumulated in
+    thousandths of a millisecond. The first hop departs at
+    start_thousandths, every later hop departs when the previous hop
+    arrived, and a hop arrives its link latency after departing.
+
+    Returns the output object with keys status, packet_id, source,
+    destination, path, hops, final_node, ttl_remaining, reason,
+    started_at_ms, finished_at_ms. Every hop carries keys from, to,
+    link, ttl_before, ttl_after, decision, departed_at_ms, latency_ms,
+    arrived_at_ms, with decision "forward".
+    """
+    source_id = node_ids[source]
+    destination_id = node_ids[destination]
+    output = {
+        "status": None,
+        "packet_id": packet_id,
+        "source": source_id,
+        "destination": destination_id,
+        "path": [source_id],
+        "hops": [],
+        "final_node": source_id,
+        "ttl_remaining": ttl,
+        "reason": None,
+        "started_at_ms": format_ms(start_thousandths),
+        "finished_at_ms": format_ms(start_thousandths),
+    }
+
+    if source == destination:
+        output["status"] = "delivered"
+        return output
+
+    route = find_route(node_ids, links, source, destination)
+    if route is None:
+        output["status"] = "dropped"
+        output["reason"] = "no_route"
+        return output
+
+    path, route_links, _total_cost = route
+    remaining = ttl
+    now = start_thousandths
+    for next_id, link_id in zip(path[1:], route_links):
+        if remaining <= 0:
+            output["status"] = "dropped"
+            output["reason"] = "ttl_exhausted"
+            output["ttl_remaining"] = remaining
+            output["finished_at_ms"] = format_ms(now)
+            return output
+        latency = link_latencies.get(link_id, 0)
+        arrived = now + latency
+        hop = {
+            "from": output["final_node"],
+            "to": next_id,
+            "link": link_id,
+            "ttl_before": remaining,
+            "ttl_after": remaining - 1,
+            "decision": "forward",
+            "departed_at_ms": format_ms(now),
+            "latency_ms": format_ms(latency),
+            "arrived_at_ms": format_ms(arrived),
+        }
+        output["hops"].append(hop)
+        now = arrived
+        remaining -= 1
+        output["path"].append(next_id)
+        output["final_node"] = next_id
+
+    output["status"] = "delivered"
+    output["ttl_remaining"] = remaining
+    output["finished_at_ms"] = format_ms(now)
     return output
 
 
@@ -1114,6 +1304,23 @@ def build_parser():
         metavar="PATH",
         help="path to the UTF-8 JSON sticky trace document",
     )
+    latency_parser = subparsers.add_parser(
+        "latency-trace",
+        help="stamp every hop of the trace with link latency times",
+        description=(
+            "Trace a packet along the deterministic minimum-cost route "
+            "and stamp every hop with departure, link-latency and "
+            "arrival times."
+        ),
+        epilog=LATENCY_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    latency_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON latency trace document",
+    )
     return parser
 
 
@@ -1179,6 +1386,29 @@ def main(argv):
             )
             output = sticky_ecmp_trace_packet(
                 node_ids, links, source, destination, packet_id, ttl, flow_id
+            )
+            write_json_line(sys.stdout, output)
+            return 0
+        if args.command == "latency-trace":
+            node_ids, links, source, destination = validate(
+                document, LATENCY_TRACE_ROOT_FIELDS
+            )
+            packet_id, ttl, _priority, _payload = validate_packet(document)
+            start_thousandths = parse_time_value(
+                document["clock_ms"], MAX_CLOCK_THOUSANDTHS, "clock_ms"
+            )
+            link_latencies = validate_latencies(
+                document, [link[0] for link in links]
+            )
+            output = latency_trace_packet(
+                node_ids,
+                links,
+                source,
+                destination,
+                packet_id,
+                ttl,
+                start_thousandths,
+                link_latencies,
             )
             write_json_line(sys.stdout, output)
             return 0
