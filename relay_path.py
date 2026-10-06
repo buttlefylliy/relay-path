@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Static minimum-cost relay routing.
+"""Static minimum-cost relay routing and per-hop packet tracing.
 
-Public entry point:
+Public entry points:
 
     python relay_path.py route --input PATH
+    python relay_path.py trace --input PATH
 
 Reads a UTF-8 JSON object describing relay nodes and directed links and
-prints the minimum-cost route from source to destination as one compact
-JSON object on stdout.
+prints the minimum-cost route from source to destination (route), or the
+hop-by-hop forwarding trace of a packet along that route (trace), as one
+compact JSON object on stdout.
 """
 
 import argparse
@@ -17,8 +19,14 @@ import sys
 
 MAX_NODES = 10000
 MAX_LINKS = 50000
+MAX_PACKET_ID_CODEPOINTS = 128
+MAX_PACKET_TTL = 255
+MAX_PACKET_PRIORITY = 7
+MAX_PAYLOAD_BYTES = 65536
 NODE_TYPES = ("relay", "terminal", "pseudo")
 ROOT_FIELDS = ("nodes", "links", "source", "destination")
+TRACE_ROOT_FIELDS = ROOT_FIELDS + ("packet",)
+PACKET_FIELDS = ("id", "ttl", "priority", "payload")
 
 FORMAT_HELP = """\
 input format (UTF-8 JSON object with exactly these four fields):
@@ -52,6 +60,46 @@ errors (single compact JSON line on stderr, keys: error, message):
   ParameterError (exit code 2) when source or destination is not declared.
 """
 
+TRACE_HELP = """\
+input format (UTF-8 JSON object with exactly these five fields):
+  nodes, links, source, destination
+              exactly as in the route command; all route constraints
+              on the topology apply unchanged
+  packet      object with exactly these four fields:
+                id        non-empty string of at most 128 Unicode
+                          code points
+                ttl       integer in 0..255
+                priority  integer in 0..7
+                payload   string of at most 65536 bytes when UTF-8
+                          encoded
+              booleans are not accepted where integers are required
+
+forwarding rules:
+  the packet follows the same deterministic minimum-cost route as the
+  route command (up links only, ties broken as in route). ttl must be
+  greater than zero before the packet leaves a node and decreases by
+  one per traversed link; arriving at the destination with ttl reduced
+  to zero still counts as delivered. A packet whose ttl is zero before
+  forwarding is dropped at the current node with reason ttl_exhausted.
+  If no route exists, the packet is dropped at the source without
+  traversing any link, with reason no_route. A source equal to its
+  destination is delivered immediately without consuming ttl. At most
+  (node count - 1) hops are possible.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, packet_id, source, destination, path, hops, final_node,
+  ttl_remaining, reason
+  status is "delivered" (reason null) or "dropped" (reason is the
+  unique drop cause). path lists the nodes actually reached; each hop
+  has keys from, to, link, ttl_before, ttl_after, decision in this
+  order, and decision is always "forward".
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3) and ParameterError (exit code 2) as in
+  route; PacketError (exit code 4) for an invalid packet, with stdout
+  left empty. All validation completes before any tracing begins.
+"""
+
 
 class ConfigError(Exception):
     """The input document is missing, malformed, or violates the schema."""
@@ -65,6 +113,13 @@ class ParameterError(Exception):
 
     error = "ParameterError"
     exit_code = 2
+
+
+class PacketError(Exception):
+    """The packet object is missing, malformed, or out of range."""
+
+    error = "PacketError"
+    exit_code = 4
 
 
 def load_document(path):
@@ -92,7 +147,7 @@ def load_document(path):
         raise ConfigError("input is not valid JSON")
 
 
-def validate(document):
+def validate(document, root_fields=ROOT_FIELDS):
     """Validate the whole document before any routing begins.
 
     Problems are reported for top-level fields in the order nodes, links,
@@ -102,10 +157,10 @@ def validate(document):
     if not isinstance(document, dict):
         raise ConfigError("root value must be a JSON object")
 
-    for name in ROOT_FIELDS:
+    for name in root_fields:
         if name not in document:
             raise ConfigError("missing field: %s" % name)
-    for name in sorted(k for k in document if k not in ROOT_FIELDS):
+    for name in sorted(k for k in document if k not in root_fields):
         raise ConfigError("unexpected field: %s" % name)
 
     raw_nodes = document["nodes"]
@@ -206,6 +261,52 @@ def validate(document):
     return node_ids, links, node_index[source], node_index[destination]
 
 
+def validate_packet(document):
+    """Validate the packet field; every problem is a PacketError.
+
+    Returns (packet_id, ttl, priority, payload).
+    """
+    packet = document["packet"]
+    if not isinstance(packet, dict):
+        raise PacketError("packet must be an object")
+    for name in PACKET_FIELDS:
+        if name not in packet:
+            raise PacketError("packet missing field: %s" % name)
+    for name in sorted(k for k in packet if k not in PACKET_FIELDS):
+        raise PacketError("packet has unexpected field: %s" % name)
+
+    packet_id = packet["id"]
+    if not isinstance(packet_id, str) or not packet_id:
+        raise PacketError("packet.id must be a non-empty string")
+    if len(packet_id) > MAX_PACKET_ID_CODEPOINTS:
+        raise PacketError(
+            "packet.id exceeds %d code points" % MAX_PACKET_ID_CODEPOINTS
+        )
+
+    ttl = packet["ttl"]
+    if type(ttl) is not int or not 0 <= ttl <= MAX_PACKET_TTL:
+        raise PacketError(
+            "packet.ttl must be an integer in 0..%d" % MAX_PACKET_TTL
+        )
+
+    priority = packet["priority"]
+    if type(priority) is not int or not 0 <= priority <= MAX_PACKET_PRIORITY:
+        raise PacketError(
+            "packet.priority must be an integer in 0..%d"
+            % MAX_PACKET_PRIORITY
+        )
+
+    payload = packet["payload"]
+    if not isinstance(payload, str):
+        raise PacketError("packet.payload must be a string")
+    if len(payload.encode("utf-8")) > MAX_PAYLOAD_BYTES:
+        raise PacketError(
+            "packet.payload exceeds %d UTF-8 bytes" % MAX_PAYLOAD_BYTES
+        )
+
+    return packet_id, ttl, priority, payload
+
+
 def shortest_distances(node_count, adjacency, source):
     """Plain Dijkstra over positive-cost directed edges."""
     dist = [None] * node_count
@@ -284,6 +385,62 @@ def find_route(node_ids, links, source, destination):
     return [node_ids[i] for i in path_indices], path_links, dist[destination]
 
 
+def trace_packet(node_ids, links, source, destination, packet_id, ttl):
+    """Forward a packet along the deterministic minimum-cost route.
+
+    Returns the output object with keys status, packet_id, source,
+    destination, path, hops, final_node, ttl_remaining, reason.
+    """
+    source_id = node_ids[source]
+    destination_id = node_ids[destination]
+    output = {
+        "status": None,
+        "packet_id": packet_id,
+        "source": source_id,
+        "destination": destination_id,
+        "path": [source_id],
+        "hops": [],
+        "final_node": source_id,
+        "ttl_remaining": ttl,
+        "reason": None,
+    }
+
+    if source == destination:
+        output["status"] = "delivered"
+        return output
+
+    route = find_route(node_ids, links, source, destination)
+    if route is None:
+        output["status"] = "dropped"
+        output["reason"] = "no_route"
+        return output
+
+    path, route_links, _total_cost = route
+    remaining = ttl
+    for next_id, link_id in zip(path[1:], route_links):
+        if remaining <= 0:
+            output["status"] = "dropped"
+            output["reason"] = "ttl_exhausted"
+            output["ttl_remaining"] = remaining
+            return output
+        hop = {
+            "from": output["final_node"],
+            "to": next_id,
+            "link": link_id,
+            "ttl_before": remaining,
+            "ttl_after": remaining - 1,
+            "decision": "forward",
+        }
+        output["hops"].append(hop)
+        remaining -= 1
+        output["path"].append(next_id)
+        output["final_node"] = next_id
+
+    output["status"] = "delivered"
+    output["ttl_remaining"] = remaining
+    return output
+
+
 def write_json_line(stream, value):
     stream.write(
         json.dumps(value, separators=(",", ":"), ensure_ascii=False) + "\n"
@@ -294,7 +451,7 @@ def write_json_line(stream, value):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="relay_path.py",
-        description="Static minimum-cost relay routing.",
+        description="Static minimum-cost relay routing and packet tracing.",
         epilog=FORMAT_HELP,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -311,6 +468,19 @@ def build_parser():
         required=True,
         metavar="PATH",
         help="path to the UTF-8 JSON routing document",
+    )
+    trace_parser = subparsers.add_parser(
+        "trace",
+        help="trace a packet hop by hop toward the destination",
+        description="Trace a packet hop by hop toward the destination.",
+        epilog=TRACE_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    trace_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON trace document",
     )
     return parser
 
@@ -329,9 +499,19 @@ def main(argv):
 
     try:
         document = load_document(args.input)
+        if args.command == "trace":
+            node_ids, links, source, destination = validate(
+                document, TRACE_ROOT_FIELDS
+            )
+            packet_id, ttl, _priority, _payload = validate_packet(document)
+            output = trace_packet(
+                node_ids, links, source, destination, packet_id, ttl
+            )
+            write_json_line(sys.stdout, output)
+            return 0
         node_ids, links, source, destination = validate(document)
         result = find_route(node_ids, links, source, destination)
-    except (ConfigError, ParameterError) as exc:
+    except (ConfigError, ParameterError, PacketError) as exc:
         write_json_line(
             sys.stderr, {"error": exc.error, "message": str(exc)}
         )
