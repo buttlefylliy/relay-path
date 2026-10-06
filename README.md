@@ -102,6 +102,14 @@ TTL 衰减、到达时 ttl 为零仍送达、起终点相同时立即送达、`n
 
 成功或业务丢弃时输出一行紧凑 JSON，顶层键依次为 `status`、`packet_id`、`source`、`destination`、`clock_ms`、`applied_events`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`。`clock_ms` 与事件时间统一补足三位小数；`applied_events` 只列实际应用的事件并保持输入顺序，每项键依次为 `at_ms`、`node`、`up`；每个 hop 的键序为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `node_event_route`）。同一输入逐字节一致。既有九个命令的输入、输出、错误和键序保持不变。
 
+### `fragment-trace --input PATH`
+
+在 `trace` 的根字段之外仅增加 `mtus` 一个字段（根对象共六个字段，拒绝其他字段）。`mtus` 是对象，键必须恰好覆盖全部已声明链路且不重复，值只能是 1 到 65536 的 JSON 整数，布尔值不得冒充整数。缺少链路、未知链路、重复 JSON 键或越界值均输出 `ConfigError`（退出码 3）；端点与报文错误仍为 `ParameterError`（2）与 `PacketError`（4），错误时标准输出为空。拓扑、端点、报文与全部 MTU 完整校验后才开始追踪。
+
+报文仍沿 `trace` 的确定性最小代价路径逐跳转发，MTU 不参与选路，路径、TTL 与丢弃归因不变。每次成功离开节点前，把 `packet.payload` 的 UTF-8 字节序列视为已重组的完整载荷，按所选链路 MTU 从前到后切片：除最后一片外均为 MTU 字节，最后一片承载余数，恰好整除时最后一片也是 MTU 字节，空载荷固定为一个长度为零的空分片。不输出或解码分片内容，允许在多字节字符内部切分。分片不额外消耗 TTL，也不改变路径；到下一节点后重新组装，后续链路再按自身 MTU 分片。`ttl_exhausted`、`no_route`、起终点相同立即送达与到达时 ttl 恰为零仍送达均沿用 `trace`；未尝试的链路不产生分片记录。跳数上限仍为节点数减一。
+
+成功或业务丢弃时输出一行紧凑 JSON，顶层字段及顺序与 `trace` 相同（`status`、`packet_id`、`source`、`destination`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`）；每个 hop 的键依次为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `fragment_forward`）、`mtu_bytes`、`payload_bytes`、`fragment_count`、`last_fragment_bytes`。前 `fragment_count` 减一片的长度均等于 `mtu_bytes`，最后一片长度由 `last_fragment_bytes` 给出，不逐个枚举分片。同一输入逐字节一致，不读墙上时钟；设实际跳数为 H、载荷字节数为 P，时间上界 O((N+M)log(N+M)+P+H)，额外内存 O(N+M+P+H)。既有十个命令的输入、输出、错误和键序保持不变。
+
 ## 状态
 
 仓库初始为空，功能按增量需求持续构建。
