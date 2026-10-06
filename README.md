@@ -62,6 +62,14 @@ TTL 衰减、到达时 ttl 为零仍送达、起终点相同时立即送达、`n
 
 成功时标准输出沿用 `trace` 的顶层键序，并在 `reason` 后依次增加 `started_at_ms`、`finished_at_ms`；每个 hop 在既有键后依次增加 `departed_at_ms`、`latency_ms`、`arrived_at_ms`。所有时间输出统一补足三位小数，相同输入逐字节一致。既有五个命令的输入、输出、错误和键序保持不变。
 
+### `loss-trace --input PATH`
+
+在 `trace` 的根字段之外仅增加 `loss_rates` 一个字段（根对象共六个字段，拒绝其他字段）。`loss_rates` 是对象，键为已声明的链路 id，值为 `0.000000` 至 `1.000000` 且恰有六位小数的十进制字符串；未列出的链路按 `0.000000` 处理。未知链路键、非字符串值、格式错误或越界均输出 `ConfigError`（退出码 3）；端点与报文错误仍为 `ParameterError`（2）与 `PacketError`（4），错误时标准输出为空。拓扑、端点、报文和全部丢包率完整校验后才开始追踪。
+
+报文仍沿 `trace` 的确定性最小代价路径转发，丢包率不改变选路。每次尝试链路前，顺序拼接 `packet.id` 的 UTF-8 字节、一个零字节、链路 id 的 UTF-8 字节、一个零字节和从零开始的尝试序号十进制 ASCII 字节，计算 SHA-256，取摘要前八字节作为大端无符号整数 `loss_value`；丢包率换算为百万分整数 `loss_units`，当 `loss_value × 1000000 < loss_units × 2^64` 时本次尝试丢失，否则到达下一节点。不使用随机数或墙上时钟：`0.000000` 永不丢失，`1.000000` 总是丢失。发送前 ttl 为零仍在当前节点以 `ttl_exhausted` 丢弃且不计算摘要；每次实际尝试消耗一次 ttl。丢失的尝试写入 hops，但不把目标节点加入 `path`，`final_node` 保持发送节点，状态为 `dropped`、`reason` 为 `link_loss`，随后停止。到达 destination 时 ttl 减为零仍算送达；`no_route`、起终点相同立即送达与节点数减一跳上限均与 `trace` 一致。时间上界 O((N+M)log(N+M))，额外内存 O(N+M)。
+
+成功时标准输出沿用 `trace` 的一行紧凑 JSON 顶层键序；每个 hop 的键依次为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`、`loss_rate`、`loss_value`，其中到达下一节点的尝试 `decision` 为 `forward`，丢失的尝试为 `drop_loss`，`loss_rate` 固定六位小数，`loss_value` 为 16 个小写十六进制字符。相同输入逐字节一致，输入数组顺序不影响结果。既有六个命令的输入、输出、错误和键序保持不变。
+
 ## 状态
 
 仓库初始为空，功能按增量需求持续构建。
