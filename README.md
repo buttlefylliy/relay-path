@@ -78,6 +78,14 @@ TTL 衰减、到达时 ttl 为零仍送达、起终点相同时立即送达、`n
 
 成功时标准输出沿用 `trace` 的顶层键序；每个 hop 在前五个字段后依次写入 `decision`、`loss_rate`、`loss_value`：`decision` 成功为 `forward`、丢失为 `drop_loss`，`loss_rate` 固定六位小数，`loss_value` 为 16 个小写十六进制字符。同一输入的输出逐字节一致，输入数组顺序不影响既有选路，时间上界 O((N+M)log(N+M))，额外内存 O(N+M)，最多记录节点数减一条尝试。既有六个命令的输入、输出、错误和键序保持不变。
 
+### `queue-trace --input PATH`
+
+在 `trace` 的根字段之外仅增加 `queue_capacities` 与 `queue_occupancies` 两个字段（根对象共七个字段，拒绝其他字段）。二者都是对象，键必须恰好覆盖全部已声明链路且不重复，值只能是 0 到 1000000000000 的 JSON 整数，布尔值不得冒充整数；同一链路的占用不得超过容量。字段缺失、额外字段、未知链路键、值非法或占用超限均输出 `ConfigError`（退出码 3）；端点与报文错误仍为 `ParameterError`（2）与 `PacketError`（4），错误时标准输出为空。拓扑、端点、报文和全部队列字段完整校验后才开始追踪。
+
+报文仍沿 `trace` 的确定性最小代价路径转发，队列不参与选路。`queue_occupancies` 表示每次尝试前该链路已排队的字节数，各链路是相互独立的快照，不读墙上时钟、不在链路间保存状态。每跳先沿用 `no_route` 与 `ttl_exhausted` 判定；尝试链路时以 `packet.payload` 的 UTF-8 字节数为 `packet_bytes`（空载荷为零字节）。若占用与报文字节之和不超过容量则准入：以该和为新占用，报文到达下一节点并消耗一次 ttl，恰好占满也成功；否则立即尾丢弃：不到达下一节点、不消耗 ttl、占用不变。起终点相同立即送达且不检查队列；无路可达仍在源节点以 `no_route` 丢弃。最多记录节点数减一条成功跳转及一次拒绝尝试。
+
+成功或业务丢弃时输出一行紧凑 JSON，顶层键序与 `trace` 相同（`status`、`packet_id`、`source`、`destination`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`）；每个 hop 在既有五个字段后依次写入 `decision`、`capacity_bytes`、`queued_bytes_before`、`packet_bytes`、`queued_bytes_after`，`decision` 准入为 `enqueue`、拒绝为 `drop_tail`。拒绝的尝试仍写入 `hops`，但目标节点不加入 `path`，`final_node` 保持发送节点，`ttl_after` 等于 `ttl_before`，状态为 `dropped`、`reason` 为 `queue_tail_drop`。同一输入逐字节一致，时间上界 O((N+M)log(N+M))，额外内存 O(N+M)。既有七个命令的输入、输出、错误和键序保持不变。
+
 ## 状态
 
 仓库初始为空，功能按增量需求持续构建。

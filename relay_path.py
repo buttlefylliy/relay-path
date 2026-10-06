@@ -11,6 +11,7 @@ Public entry points:
     python relay_path.py latency-trace --input PATH
     python relay_path.py bandwidth-trace --input PATH
     python relay_path.py loss-trace --input PATH
+    python relay_path.py queue-trace --input PATH
 
 Reads a UTF-8 JSON object describing relay nodes and directed links and
 prints the minimum-cost route from source to destination (route), the
@@ -25,8 +26,10 @@ departure, link-latency and arrival times (latency-trace), or a trace
 that additionally accounts for per-link serialization delay from the
 packet payload size and link bandwidth (bandwidth-trace), or a trace
 that drops the packet on a link when a deterministic per-hop hash falls
-below that link's configured loss rate (loss-trace), as one compact
-JSON object on stdout.
+below that link's configured loss rate (loss-trace), or a trace that
+admits the packet to a per-link queue when the queued bytes plus the
+packet bytes fit the link's capacity and tail-drops it otherwise
+(queue-trace), as one compact JSON object on stdout.
 """
 
 import argparse
@@ -53,6 +56,10 @@ WEIGHTED_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("weights",)
 LATENCY_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("clock_ms", "latencies")
 BANDWIDTH_TRACE_ROOT_FIELDS = LATENCY_TRACE_ROOT_FIELDS + ("bandwidths",)
 LOSS_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("loss_rates",)
+QUEUE_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + (
+    "queue_capacities",
+    "queue_occupancies",
+)
 PACKET_FIELDS = ("id", "ttl", "priority", "payload")
 STICKY_PACKET_FIELDS = PACKET_FIELDS + ("flow_id",)
 TIME_PATTERN = re.compile(r"[0-9]+(\.[0-9]{1,3})?\Z")
@@ -61,6 +68,7 @@ MAX_LOSS_UNITS = 1000000
 MIN_LINK_BANDWIDTH = 1
 MAX_LINK_BANDWIDTH = 1000000000000
 SERIALIZATION_SCALE_THOUSANDTHS = 1000000
+MAX_QUEUE_BYTES = 1000000000000
 
 FORMAT_HELP = """\
 input format (UTF-8 JSON object with exactly these four fields):
@@ -402,6 +410,61 @@ output (single compact JSON line on stdout, keys in this order):
   attempt and "drop_loss" for a lost one, loss_rate is the link's rate
   with exactly six fractional digits, and loss_value is the digest
   prefix as 16 lowercase hexadecimal characters.
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3), ParameterError (exit code 2) and
+  PacketError (exit code 4) as in trace; stdout is left empty. All
+  validation completes before any tracing begins.
+"""
+
+QUEUE_HELP = """\
+input format (UTF-8 JSON object with exactly these seven fields):
+  nodes, links, source, destination, packet
+              exactly as in the trace command; every topology and
+              packet constraint applies unchanged
+  queue_capacities
+              object whose keys are every declared link id and whose
+              values are JSON integers in 0..1000000000000 bytes
+              (booleans are not accepted as integers). Every declared
+              link must appear exactly once: a missing link, an
+              unknown link key or an out-of-range value is a
+              ConfigError.
+  queue_occupancies
+              object under the same rules as queue_capacities, giving
+              the bytes already queued on each link before any attempt;
+              an occupancy above the same link's capacity is a
+              ConfigError.
+
+forwarding rules:
+  the packet follows the same deterministic minimum-cost route as the
+  trace command; queue capacities and occupancies never influence the
+  path. Each link's occupancy is an independent snapshot taken before
+  the attempt; no wall clock is read and no state is kept between
+  links. no_route and ttl_exhausted are decided exactly as in trace
+  before any link is attempted. When a link is attempted, packet_bytes
+  is the UTF-8 byte count of packet.payload (an empty payload is zero
+  bytes). If queued bytes plus packet_bytes does not exceed the
+  capacity, the packet is admitted, the sum becomes the new occupancy,
+  the packet reaches the next node and one ttl is consumed; filling
+  the queue exactly still succeeds. Otherwise the packet is tail
+  dropped immediately: it does not reach the next node, consumes no
+  ttl and the occupancy is unchanged. A source equal to its
+  destination is delivered immediately without any queue check; with
+  no route the packet is still dropped at the source. At most (node
+  count - 1) successful hops plus one rejected attempt are recorded.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, packet_id, source, destination, path, hops, final_node,
+  ttl_remaining, reason
+  status is "delivered" (reason null) or "dropped" (reason is the
+  unique drop cause). path lists the nodes actually reached; each hop
+  has keys from, to, link, ttl_before, ttl_after, decision,
+  capacity_bytes, queued_bytes_before, packet_bytes,
+  queued_bytes_after in this order; decision is "enqueue" for an
+  admitted attempt and "drop_tail" for a rejected one. A rejected
+  attempt is recorded in hops, but its target node is not added to
+  path, final_node stays at the sending node, ttl_after equals
+  ttl_before, and the trace stops with reason queue_tail_drop.
 
 errors (single compact JSON line on stderr, keys: error, message):
   ConfigError (exit code 3), ParameterError (exit code 2) and
@@ -823,6 +886,66 @@ def format_loss_rate(loss_units):
     return "%d.%06d" % (loss_units // MAX_LOSS_UNITS, loss_units % MAX_LOSS_UNITS)
 
 
+def validate_queue_bytes(document, field, link_ids):
+    """Validate one queue byte-count field; every problem is a ConfigError.
+
+    The object must list every declared link id exactly once with a
+    JSON integer value in 0..1000000000000 (booleans are not integers).
+    Keys are checked in Unicode code point order so the first reported
+    problem is deterministic. Returns a mapping of link id to byte
+    count containing one entry per declared link.
+    """
+    values = document[field]
+    if not isinstance(values, dict):
+        raise ConfigError("%s must be an object" % field)
+
+    declared = set(link_ids)
+    listed = set()
+    resolved = {}
+    for link_id in sorted(values):
+        if not isinstance(link_id, str):
+            raise ConfigError("%s keys must be strings" % field)
+        if link_id not in declared:
+            raise ConfigError(
+                "%s refers to an undeclared link: %s" % (field, link_id)
+            )
+        listed.add(link_id)
+        value = values[link_id]
+        if type(value) is not int or not 0 <= value <= MAX_QUEUE_BYTES:
+            raise ConfigError(
+                "%s[%s] must be an integer in 0..%d"
+                % (field, link_id, MAX_QUEUE_BYTES)
+            )
+        resolved[link_id] = value
+    missing = declared - listed
+    if missing:
+        raise ConfigError(
+            "%s is missing declared link: %s" % (field, sorted(missing)[0])
+        )
+    return resolved
+
+
+def validate_queues(document, link_ids):
+    """Validate queue_capacities and queue_occupancies together.
+
+    Both objects must exactly cover the declared links with integer
+    byte counts (see validate_queue_bytes), and no occupancy may exceed
+    the same link's capacity; the cross check is done in Unicode code
+    point order of link ids so the first reported problem is
+    deterministic. Returns (capacities, occupancies) as mappings of
+    link id to byte count.
+    """
+    capacities = validate_queue_bytes(document, "queue_capacities", link_ids)
+    occupancies = validate_queue_bytes(document, "queue_occupancies", link_ids)
+    for link_id in sorted(capacities):
+        if occupancies[link_id] > capacities[link_id]:
+            raise ConfigError(
+                "queue_occupancies[%s] exceeds queue_capacities[%s]"
+                % (link_id, link_id)
+            )
+    return capacities, occupancies
+
+
 def shortest_distances(node_count, adjacency, source):
     """Plain Dijkstra over positive-cost directed edges."""
     dist = [None] * node_count
@@ -1230,6 +1353,98 @@ def loss_trace_packet(
             output["reason"] = "link_loss"
             output["ttl_remaining"] = remaining
             return output
+        output["path"].append(next_id)
+        output["final_node"] = next_id
+
+    output["status"] = "delivered"
+    output["ttl_remaining"] = remaining
+    return output
+
+
+def queue_trace_packet(
+    node_ids, links, source, destination, packet_id, ttl, payload,
+    queue_capacities, queue_occupancies,
+):
+    """Forward a packet along the deterministic minimum-cost route,
+    admitting it to each link's queue or tail-dropping it when the
+    queued bytes plus the packet bytes exceed the link's capacity.
+
+    Routing, ttl and drop attribution are exactly as in trace_packet;
+    queue capacities and occupancies never influence the path. Each
+    link's occupancy is an independent snapshot taken before the
+    attempt; nothing is read from a wall clock and no state is carried
+    between links. packet_bytes is the UTF-8 byte count of the payload.
+    An attempt is admitted exactly when occupancy + packet_bytes <=
+    capacity (filling the queue exactly still succeeds): the packet
+    reaches the next node and one ttl is consumed. Otherwise the packet
+    is tail dropped immediately: the attempt is recorded in hops, but
+    its target node is not added to path, final_node stays at the
+    sending node, ttl_after equals ttl_before, and the trace stops with
+    reason queue_tail_drop.
+
+    Returns the output object with keys status, packet_id, source,
+    destination, path, hops, final_node, ttl_remaining, reason. Every
+    hop carries keys from, to, link, ttl_before, ttl_after, decision,
+    capacity_bytes, queued_bytes_before, packet_bytes,
+    queued_bytes_after, with decision "enqueue" or "drop_tail".
+    """
+    source_id = node_ids[source]
+    destination_id = node_ids[destination]
+    payload_bytes = len(payload.encode("utf-8"))
+    output = {
+        "status": None,
+        "packet_id": packet_id,
+        "source": source_id,
+        "destination": destination_id,
+        "path": [source_id],
+        "hops": [],
+        "final_node": source_id,
+        "ttl_remaining": ttl,
+        "reason": None,
+    }
+
+    if source == destination:
+        output["status"] = "delivered"
+        return output
+
+    route = find_route(node_ids, links, source, destination)
+    if route is None:
+        output["status"] = "dropped"
+        output["reason"] = "no_route"
+        return output
+
+    path, route_links, _total_cost = route
+    remaining = ttl
+    for next_id, link_id in zip(path[1:], route_links):
+        if remaining <= 0:
+            output["status"] = "dropped"
+            output["reason"] = "ttl_exhausted"
+            output["ttl_remaining"] = remaining
+            return output
+        capacity = queue_capacities[link_id]
+        queued_before = queue_occupancies[link_id]
+        admitted = queued_before + payload_bytes <= capacity
+        hop = {
+            "from": output["final_node"],
+            "to": next_id,
+            "link": link_id,
+            "ttl_before": remaining,
+            "ttl_after": remaining - 1 if admitted else remaining,
+            "decision": "enqueue" if admitted else "drop_tail",
+            "capacity_bytes": capacity,
+            "queued_bytes_before": queued_before,
+            "packet_bytes": payload_bytes,
+            "queued_bytes_after": (
+                queued_before + payload_bytes if admitted else queued_before
+            ),
+        }
+        output["hops"].append(hop)
+        if not admitted:
+            output["status"] = "dropped"
+            output["reason"] = "queue_tail_drop"
+            output["ttl_remaining"] = remaining
+            return output
+        remaining -= 1
         output["path"].append(next_id)
         output["final_node"] = next_id
 
@@ -1749,6 +1964,24 @@ def build_parser():
         metavar="PATH",
         help="path to the UTF-8 JSON loss trace document",
     )
+    queue_parser = subparsers.add_parser(
+        "queue-trace",
+        help="admit a packet to per-link queues or tail-drop it",
+        description=(
+            "Trace a packet along the deterministic minimum-cost route "
+            "and admit it to each link's queue when the queued bytes "
+            "plus the packet bytes fit the link's capacity, tail "
+            "dropping it otherwise."
+        ),
+        epilog=QUEUE_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    queue_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON queue trace document",
+    )
     return parser
 
 
@@ -1884,6 +2117,27 @@ def main(argv):
                 packet_id,
                 ttl,
                 link_loss_units,
+            )
+            write_json_line(sys.stdout, output)
+            return 0
+        if args.command == "queue-trace":
+            node_ids, links, source, destination = validate(
+                document, QUEUE_TRACE_ROOT_FIELDS
+            )
+            packet_id, ttl, _priority, payload = validate_packet(document)
+            queue_capacities, queue_occupancies = validate_queues(
+                document, [link[0] for link in links]
+            )
+            output = queue_trace_packet(
+                node_ids,
+                links,
+                source,
+                destination,
+                packet_id,
+                ttl,
+                payload,
+                queue_capacities,
+                queue_occupancies,
             )
             write_json_line(sys.stdout, output)
             return 0
