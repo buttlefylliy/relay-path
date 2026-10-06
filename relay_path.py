@@ -13,6 +13,7 @@ Public entry points:
     python relay_path.py loss-trace --input PATH
     python relay_path.py queue-trace --input PATH
     python relay_path.py priority-queue-trace --input PATH
+    python relay_path.py wrr-queue-trace --input PATH
     python relay_path.py event-trace --input PATH
     python relay_path.py damped-event-trace --input PATH
     python relay_path.py node-event-trace --input PATH
@@ -39,7 +40,13 @@ packet bytes fit the link's capacity and tail-drops it otherwise
 from its service budget, highest priority first, and then admits the
 packet to its priority level or tail-drops it when the remaining
 queued bytes plus the packet bytes exceed the link's capacity
-(priority-queue-trace), or a trace that replays link failure and
+(priority-queue-trace), or a trace that serves each link's queued
+bytes in deterministic weighted round-robin rounds from priority 7
+down to 0, each non-empty level receiving at most its per-link
+service_quanta per round, and then admits the packet to its priority
+level or tail-drops it when the remaining queued bytes plus the
+packet bytes exceed the link's capacity (wrr-queue-trace), or a
+trace that replays link failure and
 recovery events
 against an explicit event clock and forwards the packet over the
 effective topology at the query time (event-trace), or a trace that
@@ -92,6 +99,12 @@ PRIORITY_QUEUE_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + (
     "queue_occupancies",
     "service_budgets",
 )
+WRR_QUEUE_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + (
+    "queue_capacities",
+    "queue_occupancies",
+    "service_budgets",
+    "service_quanta",
+)
 EVENT_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("clock_ms", "events")
 DAMPED_EVENT_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + (
     "clock_ms",
@@ -110,6 +123,8 @@ MIN_LINK_BANDWIDTH = 1
 MAX_LINK_BANDWIDTH = 1000000000000
 SERIALIZATION_SCALE_THOUSANDTHS = 1000000
 MAX_QUEUE_BYTES = 1000000000000
+MIN_SERVICE_QUANTUM = 1
+MAX_SERVICE_QUANTUM = 1000000000000
 PRIORITY_LEVELS = MAX_PACKET_PRIORITY + 1
 MAX_EVENTS = 100000
 EVENT_FIELDS = ("at_ms", "link", "up")
@@ -584,6 +599,87 @@ output (single compact JSON line on stdout, keys in this order):
   added to path, final_node stays at the sending node, ttl_after
   equals ttl_before, and the trace stops with reason
   queue_priority_tail_drop.
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3), ParameterError (exit code 2) and
+  PacketError (exit code 4) as in trace; stdout is left empty. All
+  validation completes before any tracing begins.
+"""
+
+WRR_QUEUE_HELP = """\
+input format (UTF-8 JSON object with exactly nine fields):
+  nodes, links, source, destination, packet
+              exactly as in the trace command; every topology and
+              packet constraint applies unchanged
+  queue_capacities
+              object whose keys are every declared link id and whose
+              values are JSON integers in 0..1000000000000 bytes
+              (booleans are not accepted as integers). Every declared
+              link must appear exactly once: a missing link, an
+              unknown link key or an out-of-range value is a
+              ConfigError.
+  queue_occupancies
+              object under the same coverage rules as
+              queue_capacities, whose values are arrays of exactly
+              eight JSON integers in 0..1000000000000; the entry at
+              index i gives the bytes queued at priority i (0..7)
+              before any attempt, and the eight entries of one link
+              must not sum above that link's capacity.
+  service_budgets
+              object under the same coverage and value rules as
+              queue_capacities, giving the bytes each link may serve
+              before the enqueue decision of one attempt.
+  service_quanta
+              object under the same coverage rules as
+              queue_capacities, whose values are arrays of exactly
+              eight JSON integers in 1..1000000000000; the entry at
+              index i gives the bytes the link serves one non-empty
+              priority i queue per weighted round-robin round.
+
+forwarding rules:
+  the packet follows the same deterministic minimum-cost route as the
+  trace command; queue capacities, occupancies, budgets and quanta
+  never influence the path. Each link's occupancy is an independent
+  snapshot taken before the attempt; no wall clock is read and no
+  state is kept between links. no_route and ttl_exhausted are decided
+  exactly as in trace before any link is attempted. When a link is
+  attempted, its service budget first serves the already queued bytes
+  in fixed weighted round-robin rounds: every round visits the
+  non-empty priority levels from 7 down to 0 and serves each one by at
+  most its service_quanta bytes; when the remaining budget is smaller
+  than a level's quantum, only the remaining budget is served there.
+  The next round starts again from priority 7 and rounds continue
+  until the budget is used up or every queue is empty. Unused budget
+  is discarded, and the current packet never participates in the
+  service. Then packet_bytes, the UTF-8 byte count of packet.payload
+  (an empty payload is zero bytes), is added at the packet's priority
+  level: if the total queued bytes after service plus packet_bytes do
+  not exceed the capacity, the packet is admitted, reaches the next
+  node and consumes one ttl; filling the queue exactly still succeeds.
+  Otherwise the packet is tail dropped immediately: it does not reach
+  the next node, consumes no ttl and the queue keeps only the service
+  result. A source equal to its destination is delivered immediately
+  without any queue check; with no route the packet is still dropped
+  at the source. At most (node count - 1) successful hops plus one
+  rejected attempt are recorded.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, packet_id, source, destination, path, hops, final_node,
+  ttl_remaining, reason
+  status is "delivered" (reason null) or "dropped" (reason is the
+  unique drop cause). path lists the nodes actually reached; each hop
+  has keys from, to, link, ttl_before, ttl_after, decision,
+  capacity_bytes, service_budget_bytes, service_quanta, queue_before,
+  serviced, packet_priority, packet_bytes, queue_after in this order;
+  decision is "wrr_enqueue" for an admitted attempt and
+  "drop_wrr_tail" for a rejected one. service_quanta, queue_before,
+  serviced and queue_after are always eight-entry arrays indexed by
+  priority 0..7; queue_after of an admitted attempt includes the new
+  packet, while a rejected attempt's queue_after reflects only the
+  service result. A rejected attempt is recorded in hops, but its
+  target node is not added to path, final_node stays at the sending
+  node, ttl_after equals ttl_before, and the trace stops with reason
+  wrr_queue_tail_drop.
 
 errors (single compact JSON line on stderr, keys: error, message):
   ConfigError (exit code 3), ParameterError (exit code 2) and
@@ -1476,6 +1572,80 @@ def validate_priority_queues(document, link_ids):
     return capacities, occupancies, budgets
 
 
+def validate_service_quanta(document, link_ids):
+    """Validate the service_quanta field of wrr-queue-trace.
+
+    The object must list every declared link id exactly once; each
+    value must be an array of exactly eight JSON integers in
+    1..1000000000000 (booleans are not integers), the entry at index
+    i giving the bytes served from one non-empty priority i queue per
+    weighted round-robin round. Keys are checked in Unicode code
+    point order so the first reported problem is deterministic.
+    Returns a mapping of link id to a list of eight quanta.
+    """
+    values = document["service_quanta"]
+    if not isinstance(values, dict):
+        raise ConfigError("service_quanta must be an object")
+
+    declared = set(link_ids)
+    listed = set()
+    resolved = {}
+    for link_id in sorted(values):
+        if not isinstance(link_id, str):
+            raise ConfigError("service_quanta keys must be strings")
+        if link_id not in declared:
+            raise ConfigError(
+                "service_quanta refers to an undeclared link: %s" % link_id
+            )
+        listed.add(link_id)
+        vector = values[link_id]
+        where = "service_quanta[%s]" % link_id
+        if not isinstance(vector, list) or len(vector) != PRIORITY_LEVELS:
+            raise ConfigError(
+                "%s must be an array of %d integers" % (where, PRIORITY_LEVELS)
+            )
+        entries = []
+        for pos, entry in enumerate(vector):
+            if (
+                type(entry) is not int
+                or not MIN_SERVICE_QUANTUM <= entry <= MAX_SERVICE_QUANTUM
+            ):
+                raise ConfigError(
+                    "%s[%d] must be an integer in %d..%d"
+                    % (where, pos, MIN_SERVICE_QUANTUM, MAX_SERVICE_QUANTUM)
+                )
+            entries.append(entry)
+        resolved[link_id] = entries
+    missing = declared - listed
+    if missing:
+        raise ConfigError(
+            "service_quanta is missing declared link: %s"
+            % sorted(missing)[0]
+        )
+    return resolved
+
+
+def validate_wrr_queues(document, link_ids):
+    """Validate the queue fields of wrr-queue-trace.
+
+    queue_capacities and service_budgets must exactly cover the
+    declared links with integer byte counts (see
+    validate_queue_bytes), queue_occupancies must cover them with
+    eight-entry per-priority vectors whose sums stay within capacity
+    (see validate_queue_occupancy_vectors), and service_quanta must
+    cover them with eight-entry per-priority positive integer vectors
+    (see validate_service_quanta). Returns (capacities, occupancies,
+    budgets, quanta).
+    """
+    capacities = validate_queue_bytes(document, "queue_capacities", link_ids)
+    occupancies = validate_queue_occupancy_vectors(
+        document, link_ids, capacities
+    )
+    budgets = validate_queue_bytes(document, "service_budgets", link_ids)
+    quanta = validate_service_quanta(document, link_ids)
+    return capacities, occupancies, budgets, quanta
+
+
 def validate_events(document, link_ids):
     """Validate the events field; every problem is a ConfigError.
 
@@ -2358,6 +2528,149 @@ def priority_queue_trace_packet(
         if not admitted:
             output["status"] = "dropped"
             output["reason"] = "queue_priority_tail_drop"
+            output["ttl_remaining"] = remaining
+            return output
+        remaining -= 1
+        output["path"].append(next_id)
+        output["final_node"] = next_id
+
+    output["status"] = "delivered"
+    output["ttl_remaining"] = remaining
+    return output
+
+
+def serve_wrr_queues(queue_before, budget, quanta):
+    """Serve queued bytes with deterministic weighted round-robin.
+
+    Rounds are fixed: every round visits the levels from priority 7
+    down to 0 and, for each level that is still non-empty when
+    visited, serves the smaller of its occupancy, its service_quanta
+    and the remaining budget; when the remaining budget is smaller
+    than the quantum, only the remaining budget is served there. The
+    next round starts again from priority 7, and rounds continue
+    until the budget is used up or every queue is empty. Unused
+    budget is discarded. Returns (serviced, queue_after), each an
+    eight-entry list indexed by priority 0..7; the input vector is
+    never modified.
+    """
+    queue_after = list(queue_before)
+    serviced = [0] * PRIORITY_LEVELS
+    budget_left = budget
+    while budget_left > 0:
+        progressed = False
+        for level in range(PRIORITY_LEVELS - 1, -1, -1):
+            if budget_left <= 0:
+                break
+            if queue_after[level] == 0:
+                continue
+            take = min(queue_after[level], quanta[level], budget_left)
+            serviced[level] += take
+            queue_after[level] -= take
+            budget_left -= take
+            progressed = True
+        if not progressed:
+            break
+    return serviced, queue_after
+
+
+def wrr_queue_trace_packet(
+    node_ids, links, source, destination, packet_id, ttl, priority, payload,
+    queue_capacities, queue_occupancies, service_budgets, service_quanta,
+):
+    """Forward a packet along the deterministic minimum-cost route,
+    serving each link's queued bytes in weighted round-robin rounds
+    from its service budget before admitting the packet to its
+    priority level or tail-dropping it.
+
+    Routing, ttl and drop attribution are exactly as in trace_packet;
+    queue capacities, occupancies, budgets and quanta never influence
+    the path. Each link's occupancy is an independent snapshot taken
+    before the attempt; nothing is read from a wall clock and no
+    state is carried between links. On every attempt the link's
+    budget first serves the queued bytes in fixed weighted
+    round-robin rounds (see serve_wrr_queues); unused budget is
+    discarded and the current packet never participates. Then
+    packet_bytes, the UTF-8 byte count of the payload, is added at
+    the packet's priority level: the attempt is admitted exactly when
+    the total queued bytes after service plus packet_bytes do not
+    exceed the capacity (filling the queue exactly still succeeds),
+    consuming one ttl and reaching the next node. Otherwise the
+    packet is tail dropped immediately: the attempt is recorded in
+    hops, but its target node is not added to path, final_node stays
+    at the sending node, ttl_after equals ttl_before, and the trace
+    stops with reason wrr_queue_tail_drop.
+
+    Returns the output object with keys status, packet_id, source,
+    destination, path, hops, final_node, ttl_remaining, reason. Every
+    hop carries keys from, to, link, ttl_before, ttl_after, decision,
+    capacity_bytes, service_budget_bytes, service_quanta,
+    queue_before, serviced, packet_priority, packet_bytes,
+    queue_after, with decision "wrr_enqueue" or "drop_wrr_tail";
+    service_quanta, queue_before, serviced and queue_after are
+    eight-entry arrays indexed by priority 0..7.
+    """
+    source_id = node_ids[source]
+    destination_id = node_ids[destination]
+    payload_bytes = len(payload.encode("utf-8"))
+    output = {
+        "status": None,
+        "packet_id": packet_id,
+        "source": source_id,
+        "destination": destination_id,
+        "path": [source_id],
+        "hops": [],
+        "final_node": source_id,
+        "ttl_remaining": ttl,
+        "reason": None,
+    }
+
+    if source == destination:
+        output["status"] = "delivered"
+        return output
+
+    route = find_route(node_ids, links, source, destination)
+    if route is None:
+        output["status"] = "dropped"
+        output["reason"] = "no_route"
+        return output
+
+    path, route_links, _total_cost = route
+    remaining = ttl
+    for next_id, link_id in zip(path[1:], route_links):
+        if remaining <= 0:
+            output["status"] = "dropped"
+            output["reason"] = "ttl_exhausted"
+            output["ttl_remaining"] = remaining
+            return output
+        capacity = queue_capacities[link_id]
+        budget = service_budgets[link_id]
+        quanta = service_quanta[link_id]
+        queue_before = queue_occupancies[link_id]
+        serviced, after_service = serve_wrr_queues(queue_before, budget, quanta)
+        admitted = sum(after_service) + payload_bytes <= capacity
+        queue_after = list(after_service)
+        if admitted:
+            queue_after[priority] += payload_bytes
+        hop = {
+            "from": output["final_node"],
+            "to": next_id,
+            "link": link_id,
+            "ttl_before": remaining,
+            "ttl_after": remaining - 1 if admitted else remaining,
+            "decision": "wrr_enqueue" if admitted else "drop_wrr_tail",
+            "capacity_bytes": capacity,
+            "service_budget_bytes": budget,
+            "service_quanta": list(quanta),
+            "queue_before": list(queue_before),
+            "serviced": serviced,
+            "packet_priority": priority,
+            "packet_bytes": payload_bytes,
+            "queue_after": queue_after,
+        }
+        output["hops"].append(hop)
+        if not admitted:
+            output["status"] = "dropped"
+            output["reason"] = "wrr_queue_tail_drop"
             output["ttl_remaining"] = remaining
             return output
         remaining -= 1
@@ -3397,6 +3710,26 @@ def build_parser():
         metavar="PATH",
         help="path to the UTF-8 JSON priority queue trace document",
     )
+    wrr_queue_parser = subparsers.add_parser(
+        "wrr-queue-trace",
+        help="serve per-priority queues in weighted round-robin, then admit or tail-drop",
+        description=(
+            "Trace a packet along the deterministic minimum-cost route, "
+            "serving each link's queued bytes from its service budget in "
+            "weighted round-robin rounds from priority 7 down to 0, then "
+            "admitting the packet to its priority level when the "
+            "remaining queued bytes plus the packet bytes fit the "
+            "link's capacity, tail dropping it otherwise."
+        ),
+        epilog=WRR_QUEUE_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    wrr_queue_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON weighted round-robin queue trace document",
+    )
     event_parser = subparsers.add_parser(
         "event-trace",
         help="replay link events, then trace over the effective topology",
@@ -3664,6 +3997,33 @@ def main(argv):
                 queue_capacities,
                 queue_occupancies,
                 service_budgets,
+            )
+            write_json_line(sys.stdout, output)
+            return 0
+        if args.command == "wrr-queue-trace":
+            node_ids, links, source, destination = validate(
+                document, WRR_QUEUE_TRACE_ROOT_FIELDS
+            )
+            packet_id, ttl, priority, payload = validate_packet(document)
+            (
+                queue_capacities,
+                queue_occupancies,
+                service_budgets,
+                service_quanta,
+            ) = validate_wrr_queues(document, [link[0] for link in links])
+            output = wrr_queue_trace_packet(
+                node_ids,
+                links,
+                source,
+                destination,
+                packet_id,
+                ttl,
+                priority,
+                payload,
+                queue_capacities,
+                queue_occupancies,
+                service_budgets,
+                service_quanta,
             )
             write_json_line(sys.stdout, output)
             return 0

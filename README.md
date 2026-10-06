@@ -94,6 +94,14 @@ TTL 衰减、到达时 ttl 为零仍送达、起终点相同时立即送达、`n
 
 成功或业务丢弃时输出一行紧凑 JSON，顶层键序与 `trace` 相同（`status`、`packet_id`、`source`、`destination`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`）；每个 hop 在既有五个字段后依次写入 `decision`、`capacity_bytes`、`service_budget_bytes`、`queue_before`、`serviced`、`packet_priority`、`packet_bytes`、`queue_after`，其中 `queue_before`、`serviced`、`queue_after` 均为固定八项数组（下标为优先级 0 至 7）。`decision` 准入为 `priority_enqueue`、拒绝为 `drop_priority_tail`；准入时 `queue_after` 包含新报文，拒绝时 `queue_after` 只反映服务结果。拒绝的尝试仍写入 `hops`，但目标节点不加入 `path`，`final_node` 保持发送节点，`ttl_after` 等于 `ttl_before`，状态为 `dropped`、`reason` 为 `queue_priority_tail_drop`。同一输入逐字节一致，设实际跳数为 H，时间上界 O((N+M)log(N+M)+8H)，额外内存 O(N+M+8H)。既有十四个命令的输入、输出、错误和键序保持不变。
 
+### `wrr-queue-trace --input PATH`
+
+在 `priority-queue-trace` 的根字段之外新增 `service_quanta` 一个字段（根对象共九个字段，拒绝其他字段）。`queue_capacities`、`queue_occupancies` 与 `service_budgets` 沿用 `priority-queue-trace` 的全部字段与约束；`service_quanta` 是对象，键必须恰好覆盖全部已声明链路且不重复，每条链路的值是按优先级 0 至 7 排列的八项数组，每项为 1 到 1000000000000 的 JSON 整数，布尔值不得冒充整数。结构非法、覆盖不全、出现未知链路键、重复 JSON 键或数值非法均输出 `ConfigError`（退出码 3）；端点与报文错误仍为 `ParameterError`（2）与 `PacketError`（4），错误时标准输出为空。拓扑、端点、报文和全部队列字段完整校验后才开始追踪。
+
+报文仍沿 `trace` 的确定性最小代价路径转发，队列、预算与配额不参与选路。各链路占用是相互独立的快照，不读墙上时钟、不在链路间保存状态。每跳先沿用 `no_route` 与 `ttl_exhausted` 判定；尝试链路时先用该链路预算按确定性加权轮询服务已有队列：优先级 7 到 0 构成固定轮次，每轮依次访问仍非空的级别，每个级别最多服务其 `service_quanta` 字节；剩余预算小于该级配额时只服务剩余预算，随后从优先级 7 开始下一轮，直至预算用完或所有队列全空。未用预算舍弃，当前报文不参与服务。随后以 `packet.payload` 的 UTF-8 字节数为 `packet_bytes`（空载荷为零字节）加入 `packet.priority` 对应级别：若服务后总占用加报文字节不超过容量则准入，报文到达下一节点并消耗一次 ttl，恰好占满也成功；否则立即尾丢弃：不到达下一节点、不消耗 ttl、队列只保留服务结果。起终点相同立即送达且不检查队列；无路可达仍在源节点以 `no_route` 丢弃。最多记录节点数减一条成功跳转及一次拒绝尝试。
+
+成功或业务丢弃时输出一行紧凑 JSON，顶层键序与 `trace` 相同；每个 hop 沿用 `priority-queue-trace` 的字段顺序，并在 `service_budget_bytes` 后加入八项 `service_quanta`，完整顺序为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`、`capacity_bytes`、`service_budget_bytes`、`service_quanta`、`queue_before`、`serviced`、`packet_priority`、`packet_bytes`、`queue_after`。`decision` 准入为 `wrr_enqueue`、拒绝为 `drop_wrr_tail`；`service_quanta`、`queue_before`、`serviced`、`queue_after` 均为固定八项数组（下标为优先级 0 至 7）；准入时 `queue_after` 包含新报文，拒绝时 `queue_after` 只反映服务结果。拒绝的尝试仍写入 `hops`，但目标节点不加入 `path`，`final_node` 保持发送节点，`ttl_after` 等于 `ttl_before`，状态为 `dropped`、`reason` 固定为 `wrr_queue_tail_drop`。立即送达、`no_route`、`ttl_exhausted`、`path`、`final_node` 与跳数上限沿用 `priority-queue-trace`。同一输入逐字节一致，不读墙上时钟，设实际跳数为 H，时间上界 O((N+M)log(N+M)+8H)，额外内存 O(N+M+8H)。既有十五个命令的输入、输出、错误和键序保持不变。
+
 ### `event-trace --input PATH`
 
 在 `trace` 的根字段之外仅增加 `clock_ms` 与 `events` 两个字段（根对象共七个字段，拒绝其他字段）。`clock_ms` 沿用 `latency-trace` 的规则：0 至 999999999999.999 的十进制毫秒字符串，最多三位小数，不接受指数、符号、空白和非有限值。`events` 是最多 100000 项的数组，每项只含 `at_ms`（与 `clock_ms` 同规则同范围的毫秒字符串）、`link`（必须引用已声明链路）、`up`（必须是 JSON 布尔值）；事件按 `at_ms` 非递减排列，同一时刻按数组顺序应用，允许对同一链路重复设置及随后恢复。时钟或事件的结构、顺序、引用、数量非法均输出 `ConfigError`（退出码 3），标准输出为空；拓扑、端点、报文错误仍为 `ConfigError`（3）、`ParameterError`（2）、`PacketError`（4）。拓扑、端点、报文、时钟和全部事件完整校验后才开始计算。
