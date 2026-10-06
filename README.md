@@ -46,6 +46,14 @@ TTL 与丢弃语义与 `trace` 一致：离开节点前 ttl 须大于零；到�
 
 TTL、立即送达、`no_route`、`ttl_exhausted`、节点数减一跳上限与 `ecmp-trace` 一致。成功时标准输出沿用相同的一行紧凑 JSON 顶层键序；每个 hop 的键依次为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `weighted_ecmp_hash`）、`candidate_count`、`selected_index`、`selected_weight`、`total_weight`、`selected_value`，后三个数分别记录所选链路权重、候选权重总和与取模结果，使选择可复核。成功或业务丢弃时标准错误为空，同一输入多次执行逐字节一致。
 
+### `sticky-ecmp-trace --input PATH`
+
+根字段与 `ecmp-trace` 完全相同（`nodes`、`links`、`source`、`destination`、`packet` 五个字段，拒绝其他字段）；拓扑与端点约束不变。`packet` 在既有四个字段之外增加且仅增加 `flow_id`：非空字符串、不超过 128 个 Unicode 码点；多个报文可声明相同 `flow_id` 表示同一条需要保持路径粘滞的流。字段缺失、额外字段或取值非法均输出 `PacketError`（退出码 4），标准输出为空。既有命令仍只接受各自原有 packet 结构（`trace`、`ecmp-trace`、`weighted-ecmp-trace` 出现 `flow_id` 即 PacketError）。拓扑、端点和报文全部校验完成后才开始追踪。
+
+候选集与排序与 `ecmp-trace` 完全相同（反向 Dijkstra，`dist[u] == cost + dist[v]` 的 up 出链，按目标节点 id、链路 id 的 Unicode 码点序排列），不枚举任何完整等价路径。逐跳对每个候选独立计分：依次拼接 `flow_id` 的 UTF-8 字节、一个零字节、当前节点 id 的 UTF-8 字节、一个零字节、候选目标节点 id 的 UTF-8 字节、一个零字节、候选链路 id 的 UTF-8 字节后计算 SHA-256，摘要解释为大端无符号整数作为该候选的粘滞分数；选择分数最大者，摘要相同时选择排序靠前者。同一 `flow_id` 的选择不受 `packet.id`、`priority`、`payload` 与输入数组顺序影响：候选集不变时路径一致；删除未选候选不改变本跳；删除已选候选时在剩余候选中重选；新增候选仅在分数严格更高时接管。时间上界 O((N+M)log(N+M))，额外内存 O(N+M)。
+
+TTL、到达时 ttl 为零仍送达、起终点相同立即送达（不计算候选、不消耗 ttl）、`no_route`、`ttl_exhausted`、节点数减一跳上限均与 `ecmp-trace` 一致；异常类型、退出码与标准流规则不变。成功时标准输出沿用相同的一行紧凑 JSON 顶层键序；每个 hop 的键依次为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `sticky_ecmp_hash`）、`candidate_count`、`selected_index`、`selected_score`，其中 `selected_score` 为所选候选摘要的 64 个小写十六进制字符。成功或业务丢弃时标准错误为空，不读取墙上时钟或写入状态，同一输入多次执行逐字节一致。
+
 ## 状态
 
 仓库初始为空，功能按增量需求持续构建。

@@ -7,14 +7,17 @@ Public entry points:
     python relay_path.py trace --input PATH
     python relay_path.py ecmp-trace --input PATH
     python relay_path.py weighted-ecmp-trace --input PATH
+    python relay_path.py sticky-ecmp-trace --input PATH
 
 Reads a UTF-8 JSON object describing relay nodes and directed links and
 prints the minimum-cost route from source to destination (route), the
 hop-by-hop forwarding trace of a packet along that route (trace), a
 trace that hashes the packet onto an equal-cost minimum-cost next hop at
-every node (ecmp-trace), or a trace that hashes the packet onto a
+every node (ecmp-trace), a trace that hashes the packet onto a
 weighted equal-cost next hop using per-link weights
-(weighted-ecmp-trace), as one compact JSON object on stdout.
+(weighted-ecmp-trace), or a trace that pins each flow to the
+highest-scoring equal-cost next hop by a flow id (sticky-ecmp-trace), as
+one compact JSON object on stdout.
 """
 
 import argparse
@@ -26,6 +29,7 @@ import sys
 MAX_NODES = 10000
 MAX_LINKS = 50000
 MAX_PACKET_ID_CODEPOINTS = 128
+MAX_FLOW_ID_CODEPOINTS = 128
 MAX_PACKET_TTL = 255
 MAX_PACKET_PRIORITY = 7
 MAX_PAYLOAD_BYTES = 65536
@@ -36,6 +40,7 @@ ROOT_FIELDS = ("nodes", "links", "source", "destination")
 TRACE_ROOT_FIELDS = ROOT_FIELDS + ("packet",)
 WEIGHTED_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("weights",)
 PACKET_FIELDS = ("id", "ttl", "priority", "payload")
+STICKY_PACKET_FIELDS = PACKET_FIELDS + ("flow_id",)
 
 FORMAT_HELP = """\
 input format (UTF-8 JSON object with exactly these four fields):
@@ -185,6 +190,66 @@ output (single compact JSON line on stdout, keys in this order):
   and the last three numbers record the selected link's weight, the sum
   of candidate weights, and the modulo result so the choice can be
   rechecked.
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3), ParameterError (exit code 2) and
+  PacketError (exit code 4) as in trace; stdout is left empty. All
+  validation completes before any tracing begins.
+"""
+
+STICKY_HELP = """\
+input format (UTF-8 JSON object with exactly five fields):
+  nodes, links, source, destination, packet
+              topology and endpoints exactly as in the trace command;
+              every topology constraint applies unchanged
+  packet      object with exactly these five fields:
+                id, ttl, priority, payload
+                          exactly as in the trace command
+                flow_id   non-empty string of at most 128 Unicode code
+                          points; multiple packets may share a flow_id
+                          to declare that they belong to one flow
+              a missing, extra, or illegal packet field is a
+              PacketError; booleans are not accepted where integers are
+              required
+
+forwarding rules:
+  the candidate set and ordering are exactly as in ecmp-trace: only up
+  links that can enter a minimum-total-cost path from the current node
+  to the destination, ordered by (next node id, link id) in Unicode
+  code point order; parallel links each occupy one candidate slot. Per
+  hop, each candidate is scored independently: SHA-256 is computed over
+  the UTF-8 bytes of flow_id, then one zero byte, the UTF-8 bytes of
+  the current node id, one zero byte, the UTF-8 bytes of the candidate
+  target node id, one zero byte, and the UTF-8 bytes of the candidate
+  link id; the digest interpreted as a big-endian unsigned integer is
+  the candidate's sticky score. The candidate with the greatest score
+  is selected; on equal digests the candidate earlier in the fixed
+  ordering wins. The choice for a flow_id never depends on packet.id,
+  priority, payload or input array order: while the candidate set is
+  unchanged the chosen hop is identical, removing unchosen candidates
+  never changes the hop, removing the chosen candidate re-selects among
+  the remainder, and a newly added candidate takes over only when its
+  score is greater. ttl must be greater than zero before the packet
+  leaves a node and decreases by one per traversed link; arriving at
+  the destination with ttl reduced to zero still counts as delivered.
+  A packet whose ttl is zero before forwarding is dropped at the
+  current node with reason ttl_exhausted. If no route exists, the
+  packet is dropped at the source without traversing any link, with
+  reason no_route. A source equal to its destination is delivered
+  immediately without consuming ttl. At most (node count - 1) hops are
+  possible.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, packet_id, source, destination, path, hops, final_node,
+  ttl_remaining, reason
+  status is "delivered" (reason null) or "dropped" (reason is the
+  unique drop cause). path lists the nodes actually reached; each hop
+  has keys from, to, link, ttl_before, ttl_after, decision,
+  candidate_count, selected_index, selected_score in this order;
+  decision is always "sticky_ecmp_hash", candidate_count and
+  selected_index record the number of candidates and the zero-based
+  index of the greatest-score candidate, and selected_score is that
+  candidate's digest as 64 lowercase hexadecimal characters.
 
 errors (single compact JSON line on stderr, keys: error, message):
   ConfigError (exit code 3), ParameterError (exit code 2) and
@@ -353,18 +418,22 @@ def validate(document, root_fields=ROOT_FIELDS):
     return node_ids, links, node_index[source], node_index[destination]
 
 
-def validate_packet(document):
+def validate_packet(document, packet_fields=PACKET_FIELDS):
     """Validate the packet field; every problem is a PacketError.
 
-    Returns (packet_id, ttl, priority, payload).
+    With the default packet_fields the packet is the four-field packet
+    of trace/ecmp-trace/weighted-ecmp-trace; sticky-ecmp-trace passes a
+    five-field tuple that additionally requires flow_id. Returns
+    (packet_id, ttl, priority, payload) or
+    (packet_id, ttl, priority, payload, flow_id) respectively.
     """
     packet = document["packet"]
     if not isinstance(packet, dict):
         raise PacketError("packet must be an object")
-    for name in PACKET_FIELDS:
+    for name in packet_fields:
         if name not in packet:
             raise PacketError("packet missing field: %s" % name)
-    for name in sorted(k for k in packet if k not in PACKET_FIELDS):
+    for name in sorted(k for k in packet if k not in packet_fields):
         raise PacketError("packet has unexpected field: %s" % name)
 
     packet_id = packet["id"]
@@ -395,6 +464,16 @@ def validate_packet(document):
         raise PacketError(
             "packet.payload exceeds %d UTF-8 bytes" % MAX_PAYLOAD_BYTES
         )
+
+    if "flow_id" in packet_fields:
+        flow_id = packet["flow_id"]
+        if not isinstance(flow_id, str) or not flow_id:
+            raise PacketError("packet.flow_id must be a non-empty string")
+        if len(flow_id) > MAX_FLOW_ID_CODEPOINTS:
+            raise PacketError(
+                "packet.flow_id exceeds %d code points" % MAX_FLOW_ID_CODEPOINTS
+            )
+        return packet_id, ttl, priority, payload, flow_id
 
     return packet_id, ttl, priority, payload
 
@@ -818,6 +897,126 @@ def weighted_ecmp_trace_packet(
     return output
 
 
+def sticky_candidate_score(flow_id, current_node_id, next_node_id, link_id):
+    """Per-candidate sticky score for a flow.
+
+    SHA-256 over the UTF-8 bytes of flow_id, one zero byte, the current
+    node id UTF-8 bytes, one zero byte, the candidate target node id
+    UTF-8 bytes, one zero byte, and the candidate link id UTF-8 bytes,
+    interpreted as a big-endian unsigned integer. Returns (score, hex
+    digest); the hex form is emitted verbatim as selected_score.
+    """
+    digest = hashlib.sha256()
+    digest.update(flow_id.encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(current_node_id.encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(next_node_id.encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(link_id.encode("utf-8"))
+    raw = digest.digest()
+    return int.from_bytes(raw, "big"), raw.hex()
+
+
+def sticky_ecmp_trace_packet(
+    node_ids, links, source, destination, packet_id, ttl, flow_id
+):
+    """Forward a packet by pinning its flow to the highest-scoring next hop.
+
+    Candidates are identical to ecmp-trace and arrive in the same fixed
+    (next node id, link id) order. Each candidate is scored independently
+    by sticky_candidate_score; the greatest score wins and an equal
+    digest keeps the earlier candidate, so removing unchosen candidates
+    never changes the hop while a new candidate can only take over with
+    a strictly greater score.
+
+    Returns the output object with keys status, packet_id, source,
+    destination, path, hops, final_node, ttl_remaining, reason. Every
+    hop carries keys from, to, link, ttl_before, ttl_after, decision,
+    candidate_count, selected_index, selected_score, with decision
+    "sticky_ecmp_hash".
+    """
+    source_id = node_ids[source]
+    destination_id = node_ids[destination]
+    output = {
+        "status": None,
+        "packet_id": packet_id,
+        "source": source_id,
+        "destination": destination_id,
+        "path": [source_id],
+        "hops": [],
+        "final_node": source_id,
+        "ttl_remaining": ttl,
+        "reason": None,
+    }
+
+    if source == destination:
+        output["status"] = "delivered"
+        return output
+
+    dist, candidates = ecmp_candidate_table(node_ids, links, destination)
+    if dist[source] is None:
+        output["status"] = "dropped"
+        output["reason"] = "no_route"
+        return output
+
+    remaining = ttl
+    current = source
+    hop_budget = len(node_ids) - 1
+    while current != destination:
+        if remaining <= 0:
+            output["status"] = "dropped"
+            output["reason"] = "ttl_exhausted"
+            output["ttl_remaining"] = remaining
+            return output
+        current_candidates = candidates[current]
+        if not current_candidates:
+            output["status"] = "dropped"
+            output["reason"] = "no_route"
+            output["ttl_remaining"] = remaining
+            return output
+        current_id = node_ids[current]
+        best_score = None
+        best_hex = None
+        selected = 0
+        for index, (next_node, link_id) in enumerate(current_candidates):
+            score, hex_digest = sticky_candidate_score(
+                flow_id, current_id, node_ids[next_node], link_id
+            )
+            if best_score is None or score > best_score:
+                best_score = score
+                best_hex = hex_digest
+                selected = index
+        next_node, link_id = current_candidates[selected]
+        next_id = node_ids[next_node]
+        hop = {
+            "from": output["final_node"],
+            "to": next_id,
+            "link": link_id,
+            "ttl_before": remaining,
+            "ttl_after": remaining - 1,
+            "decision": "sticky_ecmp_hash",
+            "candidate_count": len(current_candidates),
+            "selected_index": selected,
+            "selected_score": best_hex,
+        }
+        output["hops"].append(hop)
+        remaining -= 1
+        output["path"].append(next_id)
+        output["final_node"] = next_id
+        current = next_node
+        hop_budget -= 1
+        if hop_budget < 0:
+            output["status"] = "dropped"
+            output["reason"] = "no_route"
+            output["ttl_remaining"] = remaining
+            return output
+
+    output["status"] = "delivered"
+    output["ttl_remaining"] = remaining
+    return output
+
+
 def write_json_line(stream, value):
     stream.write(
         json.dumps(value, separators=(",", ":"), ensure_ascii=False) + "\n"
@@ -891,6 +1090,23 @@ def build_parser():
         metavar="PATH",
         help="path to the UTF-8 JSON weighted trace document",
     )
+    sticky_parser = subparsers.add_parser(
+        "sticky-ecmp-trace",
+        help="pin a flow to the highest-scoring equal-cost next hop at every node",
+        description=(
+            "Trace a packet whose flow is pinned by a flow id to the "
+            "highest-scoring equal-cost minimum-cost next hop at every "
+            "node."
+        ),
+        epilog=STICKY_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sticky_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON sticky trace document",
+    )
     return parser
 
 
@@ -944,6 +1160,18 @@ def main(argv):
                 packet_id,
                 ttl,
                 link_weights,
+            )
+            write_json_line(sys.stdout, output)
+            return 0
+        if args.command == "sticky-ecmp-trace":
+            node_ids, links, source, destination = validate(
+                document, TRACE_ROOT_FIELDS
+            )
+            packet_id, ttl, _priority, _payload, flow_id = validate_packet(
+                document, STICKY_PACKET_FIELDS
+            )
+            output = sticky_ecmp_trace_packet(
+                node_ids, links, source, destination, packet_id, ttl, flow_id
             )
             write_json_line(sys.stdout, output)
             return 0
