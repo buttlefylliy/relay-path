@@ -38,6 +38,14 @@ TTL 与丢弃语义与 `trace` 一致：离开节点前 ttl 须大于零；到�
 
 成功时标准输出沿用 `trace` 的一行紧凑 JSON 顶层键序（`status`、`packet_id`、`source`、`destination`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`）；每个 hop 的键序为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `ecmp_hash`）、`candidate_count`、`selected_index`，后两项记录本跳候选数与哈希选中的下标。
 
+### `weighted-ecmp-trace --input PATH`
+
+在 `ecmp-trace` 的根字段之外仅增加 `weights`（对象）：键为已声明的链路 id，值为 1 到 65535 的整数，布尔值不得冒充整数；未列出的链路权重为 1。未知链路键或非法权重输出 `ConfigError`（退出码 3）。拓扑、端点、报文与全部权重完整校验后才开始追踪；`ParameterError`（2）、`PacketError`（4）与错误时标准输出为空的规则不变。
+
+候选集与 `ecmp-trace` 完全相同：仅 `up` 且满足 `dist[u] == cost + dist[v]`（反向 Dijkstra）的出链参与，按（目标节点 id、链路 id）Unicode 码点序排列；权重只控制等价候选之间的选择，不会让不同总代价的路径进入候选。逐跳计算与 `ecmp-trace` 相同的 SHA-256 摘要（`packet.id` UTF-8 字节、零字节、当前节点 id UTF-8 字节）并解释为大端无符号整数，对候选权重总和取模；以从零开始的累计权重区间（候选 i 拥有 `[此前累计, 此前累计 + w_i)`）确定唯一候选，不按权重展开数组。空 `weights` 产生与 `ecmp-trace` 相同的路径。总权重为候选权重的精确整数和，不依赖平台；时间上界 O((N+M)log(N+M))，额外内存 O(N+M)。
+
+TTL、立即送达、`no_route`、`ttl_exhausted`、节点数减一跳上限与 `ecmp-trace` 一致。成功时标准输出沿用相同的一行紧凑 JSON 顶层键序；每个 hop 的键依次为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `weighted_ecmp_hash`）、`candidate_count`、`selected_index`、`selected_weight`、`total_weight`、`selected_value`，后三个数分别记录所选链路权重、候选权重总和与取模结果，使选择可复核。成功或业务丢弃时标准错误为空，同一输入多次执行逐字节一致。
+
 ## 状态
 
 仓库初始为空，功能按增量需求持续构建。

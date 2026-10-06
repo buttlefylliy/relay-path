@@ -6,12 +6,15 @@ Public entry points:
     python relay_path.py route --input PATH
     python relay_path.py trace --input PATH
     python relay_path.py ecmp-trace --input PATH
+    python relay_path.py weighted-ecmp-trace --input PATH
 
 Reads a UTF-8 JSON object describing relay nodes and directed links and
 prints the minimum-cost route from source to destination (route), the
-hop-by-hop forwarding trace of a packet along that route (trace), or a
+hop-by-hop forwarding trace of a packet along that route (trace), a
 trace that hashes the packet onto an equal-cost minimum-cost next hop at
-every node (ecmp-trace), as one compact JSON object on stdout.
+every node (ecmp-trace), or a trace that hashes the packet onto a
+weighted equal-cost next hop using per-link weights
+(weighted-ecmp-trace), as one compact JSON object on stdout.
 """
 
 import argparse
@@ -26,9 +29,12 @@ MAX_PACKET_ID_CODEPOINTS = 128
 MAX_PACKET_TTL = 255
 MAX_PACKET_PRIORITY = 7
 MAX_PAYLOAD_BYTES = 65536
+MIN_LINK_WEIGHT = 1
+MAX_LINK_WEIGHT = 65535
 NODE_TYPES = ("relay", "terminal", "pseudo")
 ROOT_FIELDS = ("nodes", "links", "source", "destination")
 TRACE_ROOT_FIELDS = ROOT_FIELDS + ("packet",)
+WEIGHTED_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("weights",)
 PACKET_FIELDS = ("id", "ttl", "priority", "payload")
 
 FORMAT_HELP = """\
@@ -138,6 +144,47 @@ output (single compact JSON line on stdout, keys in this order):
   candidate_count, selected_index in this order; decision is always
   "ecmp_hash", and candidate_count and selected_index record the number
   of candidates and the hash-selected zero-based index at that hop.
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3), ParameterError (exit code 2) and
+  PacketError (exit code 4) as in trace; stdout is left empty. All
+  validation completes before any tracing begins.
+"""
+
+WEIGHTED_HELP = """\
+input format (UTF-8 JSON object with exactly six fields):
+  nodes, links, source, destination, packet
+              exactly as in the trace command; every topology and
+              packet constraint applies unchanged
+  weights     object whose keys are declared link ids and whose values
+              are integers in 1..65535 (booleans are not accepted as
+              integers); links not listed default to weight 1. Unknown
+              link keys and out-of-range weights are ConfigErrors.
+
+forwarding rules:
+  the candidate set is exactly as in ecmp-trace: only up links that can
+  enter a minimum-total-cost path from the current node to the
+  destination, ordered by (next node id, link id) in Unicode code point
+  order. Weights never admit a non-equal-cost alternative. Per hop, the
+  same SHA-256 digest as in ecmp-trace (packet.id UTF-8 bytes, one zero
+  byte, current node id UTF-8 bytes) is interpreted as a big-endian
+  unsigned integer and taken modulo the sum of the candidate weights;
+  the unique candidate is located by zero-based cumulative weight
+  intervals, never by expanding an array by weight. An empty weights
+  object selects exactly as ecmp-trace does. ttl, delivery, no_route,
+  ttl_exhausted and the (node count - 1) hop bound are unchanged.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, packet_id, source, destination, path, hops, final_node,
+  ttl_remaining, reason
+  status is "delivered" (reason null) or "dropped" (reason is the
+  unique drop cause). path lists the nodes actually reached; each hop
+  has keys from, to, link, ttl_before, ttl_after, decision,
+  candidate_count, selected_index, selected_weight, total_weight,
+  selected_value in this order; decision is always "weighted_ecmp_hash",
+  and the last three numbers record the selected link's weight, the sum
+  of candidate weights, and the modulo result so the choice can be
+  rechecked.
 
 errors (single compact JSON line on stderr, keys: error, message):
   ConfigError (exit code 3), ParameterError (exit code 2) and
@@ -350,6 +397,36 @@ def validate_packet(document):
         )
 
     return packet_id, ttl, priority, payload
+
+
+def validate_weights(document, link_ids):
+    """Validate the weights field; every problem is a ConfigError.
+
+    Keys must refer to declared link ids and values must be integers in
+    1..65535 (booleans are not integers). Keys are checked in Unicode
+    code point order so the first reported problem is deterministic.
+    Links absent from the object default to weight 1. Returns a mapping
+    of link id to weight containing only explicitly listed links.
+    """
+    weights = document["weights"]
+    if not isinstance(weights, dict):
+        raise ConfigError("weights must be an object")
+
+    declared = set(link_ids)
+    resolved = {}
+    for link_id in sorted(weights):
+        if not isinstance(link_id, str):
+            raise ConfigError("weights keys must be strings")
+        if link_id not in declared:
+            raise ConfigError("weights refers to an undeclared link: %s" % link_id)
+        value = weights[link_id]
+        if type(value) is not int or not MIN_LINK_WEIGHT <= value <= MAX_LINK_WEIGHT:
+            raise ConfigError(
+                "weights[%s] must be an integer in %d..%d"
+                % (link_id, MIN_LINK_WEIGHT, MAX_LINK_WEIGHT)
+            )
+        resolved[link_id] = value
+    return resolved
 
 
 def shortest_distances(node_count, adjacency, source):
@@ -623,6 +700,124 @@ def ecmp_trace_packet(node_ids, links, source, destination, packet_id, ttl):
     return output
 
 
+def weighted_ecmp_hash_value(packet_id, current_node_id):
+    """SHA-256 digest of packet id and current node id, as an unsigned int.
+
+    Same byte sequence as select_ecmp_index: packet.id UTF-8 bytes, one
+    zero byte, then the current node id UTF-8 bytes, interpreted
+    big-endian. The caller applies the modulo (candidate count or total
+    candidate weight) so the raw value stays auditable.
+    """
+    digest = hashlib.sha256()
+    digest.update(packet_id.encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(current_node_id.encode("utf-8"))
+    return int.from_bytes(digest.digest(), "big")
+
+
+def weighted_ecmp_trace_packet(
+    node_ids, links, source, destination, packet_id, ttl, link_weights
+):
+    """Forward a packet by hashing onto a weighted equal-cost next hop.
+
+    Candidates are identical to ecmp-trace. The hash value is taken
+    modulo the sum of candidate weights, then mapped to a candidate via
+    zero-based cumulative weight intervals: candidate i owns the
+    half-open interval [cumulative before i, cumulative after i). The
+    candidate array is never expanded by weight.
+
+    Returns the output object with keys status, packet_id, source,
+    destination, path, hops, final_node, ttl_remaining, reason. Every
+    hop carries keys from, to, link, ttl_before, ttl_after, decision,
+    candidate_count, selected_index, selected_weight, total_weight,
+    selected_value, with decision "weighted_ecmp_hash".
+    """
+    source_id = node_ids[source]
+    destination_id = node_ids[destination]
+    output = {
+        "status": None,
+        "packet_id": packet_id,
+        "source": source_id,
+        "destination": destination_id,
+        "path": [source_id],
+        "hops": [],
+        "final_node": source_id,
+        "ttl_remaining": ttl,
+        "reason": None,
+    }
+
+    if source == destination:
+        output["status"] = "delivered"
+        return output
+
+    dist, candidates = ecmp_candidate_table(node_ids, links, destination)
+    if dist[source] is None:
+        output["status"] = "dropped"
+        output["reason"] = "no_route"
+        return output
+
+    remaining = ttl
+    current = source
+    hop_budget = len(node_ids) - 1
+    while current != destination:
+        if remaining <= 0:
+            output["status"] = "dropped"
+            output["reason"] = "ttl_exhausted"
+            output["ttl_remaining"] = remaining
+            return output
+        current_candidates = candidates[current]
+        if not current_candidates:
+            output["status"] = "dropped"
+            output["reason"] = "no_route"
+            output["ttl_remaining"] = remaining
+            return output
+        weights = [
+            link_weights.get(link_id, 1) for _next_node, link_id in current_candidates
+        ]
+        total_weight = sum(weights)
+        value = weighted_ecmp_hash_value(packet_id, node_ids[current])
+        selected_value = value % total_weight
+        cumulative = 0
+        selected = 0
+        selected_weight = weights[0]
+        for index, weight in enumerate(weights):
+            if selected_value < cumulative + weight:
+                selected = index
+                selected_weight = weight
+                break
+            cumulative += weight
+        next_node, link_id = current_candidates[selected]
+        next_id = node_ids[next_node]
+        hop = {
+            "from": output["final_node"],
+            "to": next_id,
+            "link": link_id,
+            "ttl_before": remaining,
+            "ttl_after": remaining - 1,
+            "decision": "weighted_ecmp_hash",
+            "candidate_count": len(current_candidates),
+            "selected_index": selected,
+            "selected_weight": selected_weight,
+            "total_weight": total_weight,
+            "selected_value": selected_value,
+        }
+        output["hops"].append(hop)
+        remaining -= 1
+        output["path"].append(next_id)
+        output["final_node"] = next_id
+        current = next_node
+        hop_budget -= 1
+        if hop_budget < 0:
+            output["status"] = "dropped"
+            output["reason"] = "no_route"
+            output["ttl_remaining"] = remaining
+            return output
+
+    output["status"] = "delivered"
+    output["ttl_remaining"] = remaining
+    return output
+
+
 def write_json_line(stream, value):
     stream.write(
         json.dumps(value, separators=(",", ":"), ensure_ascii=False) + "\n"
@@ -680,6 +875,22 @@ def build_parser():
         metavar="PATH",
         help="path to the UTF-8 JSON trace document",
     )
+    weighted_parser = subparsers.add_parser(
+        "weighted-ecmp-trace",
+        help="hash a packet onto a weighted equal-cost next hop at every node",
+        description=(
+            "Trace a packet that is hashed onto a weighted equal-cost "
+            "minimum-cost next hop at every node."
+        ),
+        epilog=WEIGHTED_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    weighted_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON weighted trace document",
+    )
     return parser
 
 
@@ -714,6 +925,25 @@ def main(argv):
             packet_id, ttl, _priority, _payload = validate_packet(document)
             output = ecmp_trace_packet(
                 node_ids, links, source, destination, packet_id, ttl
+            )
+            write_json_line(sys.stdout, output)
+            return 0
+        if args.command == "weighted-ecmp-trace":
+            node_ids, links, source, destination = validate(
+                document, WEIGHTED_TRACE_ROOT_FIELDS
+            )
+            packet_id, ttl, _priority, _payload = validate_packet(document)
+            link_weights = validate_weights(
+                document, [link[0] for link in links]
+            )
+            output = weighted_ecmp_trace_packet(
+                node_ids,
+                links,
+                source,
+                destination,
+                packet_id,
+                ttl,
+                link_weights,
             )
             write_json_line(sys.stdout, output)
             return 0
