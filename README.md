@@ -28,6 +28,16 @@
 
 成功时标准输出一行紧凑 JSON，键序为 `status`、`packet_id`、`source`、`destination`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`；每个 hop 的键序为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `forward`）。送达时 `reason` 为 null，标准错误为空。
 
+### `ecmp-trace --input PATH`
+
+输入与 `trace` 完全相同（同样的拓扑根字段与 `packet` 字段、数量上限与完整校验顺序）；报文与错误语义（`ConfigError` 退出码 3、`ParameterError` 退出码 2、`PacketError` 退出码 4，错误时标准输出为空、成功或业务丢弃时标准错误为空，全部校验完成后才追踪）也与 `trace` 一致。
+
+在每个节点，候选出链是 up 且能进入从当前节点到 destination 的最小总代价路径的出链：在反向图上从 destination 做一次 Dijkstra 得到各节点到终点的最小代价 `dist`，出链 `u→v`（代价 c）成为候选当且仅当 `dist[u] == c + dist[v]`；不同总代价的备选不参与，正代价保证每跳严格降距从而不会成环。平行链路各占一个候选位置；候选按（目标节点 id、链路 id）的 Unicode 码点序排列。不枚举任何完整路径。
+
+每跳将 `packet.id` 的 UTF-8 字节、一个零字节、当前节点 id 的 UTF-8 字节依次拼接后计算 SHA-256，摘要作为大端无符号整数对候选数取模，得到从零开始的选中下标；`priority`、`payload` 与输入数组顺序不影响选择。
+
+输出沿用 trace 的顶层字段与固定键序；每个实际 hop 的键序为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`、`candidate_count`、`selected_index`，其中 `decision` 固定为 `ecmp_hash`，后两项记录本跳候选数与选中下标。source 等于 destination 时直接送达、不计算候选也不消耗 ttl；无路在 source 以 `no_route` 丢弃；转发前 ttl 为零在当前节点以 `ttl_exhausted` 丢弃，到达 destination 时 ttl 恰减为零仍算送达。单次调用最多节点数减一跳；时间上界 O((N+M)log(N+M))，额外内存 O(N+M)。
+
 ## 状态
 
 仓库初始为空，功能按增量需求持续构建。
