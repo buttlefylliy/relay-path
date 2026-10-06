@@ -12,6 +12,7 @@ Public entry points:
     python relay_path.py bandwidth-trace --input PATH
     python relay_path.py loss-trace --input PATH
     python relay_path.py queue-trace --input PATH
+    python relay_path.py priority-queue-trace --input PATH
     python relay_path.py event-trace --input PATH
     python relay_path.py damped-event-trace --input PATH
     python relay_path.py node-event-trace --input PATH
@@ -34,7 +35,11 @@ that drops the packet on a link when a deterministic per-hop hash falls
 below that link's configured loss rate (loss-trace), or a trace that
 admits the packet to a per-link queue when the queued bytes plus the
 packet bytes fit the link's capacity and tail-drops it otherwise
-(queue-trace), or a trace that replays link failure and recovery events
+(queue-trace), or a trace that first services each link's eight
+priority queues with the link's service budget from priority seven
+down and then enqueues the packet by its own priority, tail-dropping
+it when the serviced queues plus the packet bytes exceed the link's
+capacity (priority-queue-trace), or a trace that replays link failure and recovery events
 against an explicit event clock and forwards the packet over the
 effective topology at the query time (event-trace), or a trace that
 gives every link event a stabilization hold-down period before it
@@ -81,6 +86,11 @@ QUEUE_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + (
     "queue_capacities",
     "queue_occupancies",
 )
+PRIORITY_QUEUE_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + (
+    "queue_capacities",
+    "queue_occupancies",
+    "service_budgets",
+)
 EVENT_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("clock_ms", "events")
 DAMPED_EVENT_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + (
     "clock_ms",
@@ -99,6 +109,7 @@ MIN_LINK_BANDWIDTH = 1
 MAX_LINK_BANDWIDTH = 1000000000000
 SERIALIZATION_SCALE_THOUSANDTHS = 1000000
 MAX_QUEUE_BYTES = 1000000000000
+PRIORITY_QUEUE_LEVELS = 8
 MAX_EVENTS = 100000
 EVENT_FIELDS = ("at_ms", "link", "up")
 NODE_EVENT_FIELDS = ("at_ms", "node", "up")
@@ -501,6 +512,79 @@ output (single compact JSON line on stdout, keys in this order):
   attempt is recorded in hops, but its target node is not added to
   path, final_node stays at the sending node, ttl_after equals
   ttl_before, and the trace stops with reason queue_tail_drop.
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3), ParameterError (exit code 2) and
+  PacketError (exit code 4) as in trace; stdout is left empty. All
+  validation completes before any tracing begins.
+"""
+
+PRIORITY_QUEUE_HELP = """\
+input format (UTF-8 JSON object with exactly these eight fields):
+  nodes, links, source, destination, packet
+              exactly as in the trace command; every topology and
+              packet constraint applies unchanged
+  queue_capacities
+              object whose keys are every declared link id and whose
+              values are JSON integers in 0..1000000000000 bytes
+              (booleans are not accepted as integers). Every declared
+              link must appear exactly once: a missing link, an
+              unknown link key or an out-of-range value is a
+              ConfigError.
+  queue_occupancies
+              object under the same key rules as queue_capacities;
+              each value is an array of exactly eight JSON integers
+              in 0..1000000000000, indexed by priority 0..7. The
+              eight values are the bytes already queued at each
+              priority before any attempt; their sum must not exceed
+              the same link's capacity. A wrong length, a non-array,
+              an unknown link key or an out-of-range value is a
+              ConfigError.
+  service_budgets
+              object under the same rules as queue_capacities,
+              giving the per-attempt service budget in bytes for
+              each link.
+
+forwarding rules:
+  the packet follows the same deterministic minimum-cost route as
+  the trace command; capacities, occupancies and budgets never
+  influence the path. Each link's occupancies are an independent
+  snapshot taken before its attempt; no wall clock is read and no
+  state is kept between links. no_route and ttl_exhausted are
+  decided exactly as in trace before any link is attempted. When a
+  link is attempted, its budget first services already queued
+  bytes: starting from priority 7 down to 0, each level is drained
+  by the smaller of its occupancy and the remaining budget; unused
+  budget is discarded and the current packet never participates in
+  servicing. packet_bytes is the UTF-8 byte count of packet.payload
+  (an empty payload is zero bytes), and the packet is then added to
+  its own priority queue. If the total serviced occupancy plus
+  packet_bytes does not exceed the capacity, the packet is
+  admitted: it reaches the next node and one ttl is consumed, and
+  filling the queue exactly still succeeds. Otherwise the packet is
+  tail dropped at the sending node: it does not reach the next
+  node, consumes no ttl, and the queues only reflect the service.
+  A source equal to its destination is delivered immediately
+  without any queue check; with no route the packet is still
+  dropped at the source. At most (node count - 1) successful hops
+  plus one rejected attempt are recorded.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, packet_id, source, destination, path, hops, final_node,
+  ttl_remaining, reason
+  status is "delivered" (reason null) or "dropped" (reason is the
+  unique cause). path lists the nodes actually reached; each hop
+  has keys from, to, link, ttl_before, ttl_after, decision,
+  capacity_bytes, service_budget_bytes, queue_before, serviced,
+  packet_priority, packet_bytes, queue_after in this order; decision
+  is "priority_enqueue" for an admitted attempt and
+  "drop_priority_tail" for a rejected one. queue_before, serviced
+  and queue_after are fixed eight-item arrays indexed by priority
+  0..7; queue_after includes the new packet for an admitted attempt
+  and reflects only the service for a rejected one. A rejected
+  attempt is recorded in hops, but its target node is not added to
+  path, final_node stays at the sending node, ttl_after equals
+  ttl_before, and the trace stops with reason queue_priority_tail_drop.
 
 errors (single compact JSON line on stderr, keys: error, message):
   ConfigError (exit code 3), ParameterError (exit code 2) and
@@ -1318,6 +1402,89 @@ def validate_queues(document, link_ids):
     return capacities, occupancies
 
 
+def validate_priority_queue_bytes(document, field, link_ids):
+    """Validate an object whose values are fixed eight-item integer
+    arrays, one entry per declared link; every problem is a ConfigError.
+
+    Used for queue_occupancies in the priority-queue command. Keys must
+    exactly cover the declared link ids, and every value must be an
+    array of exactly eight JSON integers in 0..1000000000000 (booleans
+    are not integers), indexed by priority 0..7. Keys are checked in
+    Unicode code point order so the first reported problem is
+    deterministic. Returns a mapping of link id to an eight-item list
+    of byte counts containing one entry per declared link.
+    """
+    values = document[field]
+    if not isinstance(values, dict):
+        raise ConfigError("%s must be an object" % field)
+
+    declared = set(link_ids)
+    listed = set()
+    resolved = {}
+    for link_id in sorted(values):
+        if not isinstance(link_id, str):
+            raise ConfigError("%s keys must be strings" % field)
+        if link_id not in declared:
+            raise ConfigError(
+                "%s refers to an undeclared link: %s" % (field, link_id)
+            )
+        listed.add(link_id)
+        entry = values[link_id]
+        if not isinstance(entry, list):
+            raise ConfigError(
+                "%s[%s] must be an array of eight integers"
+                % (field, link_id)
+            )
+        if len(entry) != PRIORITY_QUEUE_LEVELS:
+            raise ConfigError(
+                "%s[%s] must contain exactly eight entries"
+                % (field, link_id)
+            )
+        levels = []
+        for priority, value in enumerate(entry):
+            if type(value) is not int or not 0 <= value <= MAX_QUEUE_BYTES:
+                raise ConfigError(
+                    "%s[%s][%d] must be an integer in 0..%d"
+                    % (field, link_id, priority, MAX_QUEUE_BYTES)
+                )
+            levels.append(value)
+        resolved[link_id] = levels
+    missing = declared - listed
+    if missing:
+        raise ConfigError(
+            "%s is missing declared link: %s" % (field, sorted(missing)[0])
+        )
+    return resolved
+
+
+def validate_priority_queues(document, link_ids):
+    """Validate the priority-queue-trace queue fields together.
+
+    queue_capacities and service_budgets must exactly cover the
+    declared links with scalar integer byte counts (see
+    validate_queue_bytes), and queue_occupancies must cover them with
+    fixed eight-item integer arrays (see
+    validate_priority_queue_bytes); the eight per-priority occupancies
+    of a link must sum to no more than its capacity. Cross checks run
+    in Unicode code point order of link ids so the first reported
+    problem is deterministic. Returns (capacities, occupancies,
+    budgets) as mappings of link id to byte count, with occupancies as
+    eight-item lists.
+    """
+    capacities = validate_queue_bytes(document, "queue_capacities", link_ids)
+    occupancies = validate_priority_queue_bytes(
+        document, "queue_occupancies", link_ids
+    )
+    budgets = validate_queue_bytes(document, "service_budgets", link_ids)
+    for link_id in sorted(capacities):
+        if sum(occupancies[link_id]) > capacities[link_id]:
+            raise ConfigError(
+                "queue_occupancies[%s] total exceeds queue_capacities[%s]"
+                % (link_id, link_id)
+            )
+    return capacities, occupancies, budgets
+
+
 def validate_events(document, link_ids):
     """Validate the events field; every problem is a ConfigError.
 
@@ -2086,6 +2253,135 @@ def queue_trace_packet(
         if not admitted:
             output["status"] = "dropped"
             output["reason"] = "queue_tail_drop"
+            output["ttl_remaining"] = remaining
+            return output
+        remaining -= 1
+        output["path"].append(next_id)
+        output["final_node"] = next_id
+
+    output["status"] = "delivered"
+    output["ttl_remaining"] = remaining
+    return output
+
+
+def priority_queue_service(queue_before, budget):
+    """Service eight priority queues with one attempt's byte budget.
+
+    Starting from priority 7 down to 0, each level is drained by the
+    smaller of its occupancy and the remaining budget; unused budget
+    is discarded. The input snapshot is never modified. Returns
+    (serviced, queue_after_service): serviced records the bytes removed
+    at each priority and queue_after_service the occupancies left
+    after servicing, both fixed eight-item lists indexed by priority.
+    """
+    remaining_budget = budget
+    serviced = [0] * PRIORITY_QUEUE_LEVELS
+    after = list(queue_before)
+    for priority in range(PRIORITY_QUEUE_LEVELS - 1, -1, -1):
+        drained = min(after[priority], remaining_budget)
+        serviced[priority] = drained
+        after[priority] -= drained
+        remaining_budget -= drained
+    return serviced, after
+
+
+def priority_queue_trace_packet(
+    node_ids, links, source, destination, packet_id, ttl, priority,
+    payload, queue_capacities, queue_occupancies, service_budgets,
+):
+    """Forward a packet along the deterministic minimum-cost route,
+    servicing each link's eight priority queues with its budget before
+    enqueuing the packet by its own priority.
+
+    Routing, ttl and drop attribution are exactly as in trace_packet;
+    capacities, occupancies and budgets never influence the path. Each
+    link's occupancies are an independent snapshot taken before the
+    attempt; nothing is read from a wall clock and no state is carried
+    between links. When a link is attempted, its budget first services
+    already queued bytes from priority 7 down to 0 (see
+    priority_queue_service), taking the smaller of each level's
+    occupancy and the remaining budget and discarding unused budget;
+    the current packet never participates in that servicing. packet
+    bytes, the UTF-8 byte count of the payload, are then added to the
+    packet's own priority queue. An attempt is admitted exactly when
+    the serviced total occupancy plus packet_bytes is at most the
+    capacity (filling the queue exactly still succeeds): the packet
+    reaches the next node and one ttl is consumed. Otherwise the
+    packet is tail dropped at the sending node: the attempt is
+    recorded in hops, but its target node is not added to path,
+    final_node stays at the sending node, ttl_after equals
+    ttl_before, the queues only reflect the service, and the trace
+    stops with reason queue_priority_tail_drop.
+
+    Returns the output object with keys status, packet_id, source,
+    destination, path, hops, final_node, ttl_remaining, reason. Every
+    hop carries keys from, to, link, ttl_before, ttl_after, decision,
+    capacity_bytes, service_budget_bytes, queue_before, serviced,
+    packet_priority, packet_bytes, queue_after, with decision
+    "priority_enqueue" or "drop_priority_tail" and the three queue
+    arrays fixed to eight items.
+    """
+    source_id = node_ids[source]
+    destination_id = node_ids[destination]
+    payload_bytes = len(payload.encode("utf-8"))
+    output = {
+        "status": None,
+        "packet_id": packet_id,
+        "source": source_id,
+        "destination": destination_id,
+        "path": [source_id],
+        "hops": [],
+        "final_node": source_id,
+        "ttl_remaining": ttl,
+        "reason": None,
+    }
+
+    if source == destination:
+        output["status"] = "delivered"
+        return output
+
+    route = find_route(node_ids, links, source, destination)
+    if route is None:
+        output["status"] = "dropped"
+        output["reason"] = "no_route"
+        return output
+
+    path, route_links, _total_cost = route
+    remaining = ttl
+    for next_id, link_id in zip(path[1:], route_links):
+        if remaining <= 0:
+            output["status"] = "dropped"
+            output["reason"] = "ttl_exhausted"
+            output["ttl_remaining"] = remaining
+            return output
+        capacity = queue_capacities[link_id]
+        budget = service_budgets[link_id]
+        queue_before = queue_occupancies[link_id]
+        serviced, after_service = priority_queue_service(queue_before, budget)
+        occupied_after_service = sum(after_service)
+        admitted = occupied_after_service + payload_bytes <= capacity
+        queue_after = list(after_service)
+        if admitted:
+            queue_after[priority] += payload_bytes
+        hop = {
+            "from": output["final_node"],
+            "to": next_id,
+            "link": link_id,
+            "ttl_before": remaining,
+            "ttl_after": remaining - 1 if admitted else remaining,
+            "decision": "priority_enqueue" if admitted else "drop_priority_tail",
+            "capacity_bytes": capacity,
+            "service_budget_bytes": budget,
+            "queue_before": list(queue_before),
+            "serviced": serviced,
+            "packet_priority": priority,
+            "packet_bytes": payload_bytes,
+            "queue_after": queue_after,
+        }
+        output["hops"].append(hop)
+        if not admitted:
+            output["status"] = "dropped"
+            output["reason"] = "queue_priority_tail_drop"
             output["ttl_remaining"] = remaining
             return output
         remaining -= 1
@@ -3105,6 +3401,26 @@ def build_parser():
         metavar="PATH",
         help="path to the UTF-8 JSON queue trace document",
     )
+    priority_queue_parser = subparsers.add_parser(
+        "priority-queue-trace",
+        help="service eight priority queues, then enqueue or tail-drop",
+        description=(
+            "Trace a packet along the deterministic minimum-cost route "
+            "where every link first services its eight priority queues "
+            "with a service budget from priority seven down and then "
+            "enqueues the packet by its own priority, tail dropping it "
+            "when the serviced queues plus the packet bytes exceed the "
+            "link's capacity."
+        ),
+        epilog=PRIORITY_QUEUE_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    priority_queue_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON priority queue trace document",
+    )
     event_parser = subparsers.add_parser(
         "event-trace",
         help="replay link events, then trace over the effective topology",
@@ -3349,6 +3665,31 @@ def main(argv):
                 payload,
                 queue_capacities,
                 queue_occupancies,
+            )
+            write_json_line(sys.stdout, output)
+            return 0
+        if args.command == "priority-queue-trace":
+            node_ids, links, source, destination = validate(
+                document, PRIORITY_QUEUE_TRACE_ROOT_FIELDS
+            )
+            packet_id, ttl, priority, payload = validate_packet(document)
+            (
+                queue_capacities,
+                queue_occupancies,
+                service_budgets,
+            ) = validate_priority_queues(document, [link[0] for link in links])
+            output = priority_queue_trace_packet(
+                node_ids,
+                links,
+                source,
+                destination,
+                packet_id,
+                ttl,
+                priority,
+                payload,
+                queue_capacities,
+                queue_occupancies,
+                service_budgets,
             )
             write_json_line(sys.stdout, output)
             return 0
