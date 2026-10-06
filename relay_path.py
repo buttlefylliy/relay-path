@@ -5,14 +5,17 @@ Public entry points:
 
     python relay_path.py route --input PATH
     python relay_path.py trace --input PATH
+    python relay_path.py ecmp-trace --input PATH
 
 Reads a UTF-8 JSON object describing relay nodes and directed links and
-prints the minimum-cost route from source to destination (route), or the
-hop-by-hop forwarding trace of a packet along that route (trace), as one
-compact JSON object on stdout.
+prints the minimum-cost route from source to destination (route), the
+hop-by-hop forwarding trace of a packet along that route (trace), or a
+trace that hashes the packet onto an equal-cost minimum-cost next hop at
+every node (ecmp-trace), as one compact JSON object on stdout.
 """
 
 import argparse
+import hashlib
 import heapq
 import json
 import sys
@@ -98,6 +101,48 @@ errors (single compact JSON line on stderr, keys: error, message):
   ConfigError (exit code 3) and ParameterError (exit code 2) as in
   route; PacketError (exit code 4) for an invalid packet, with stdout
   left empty. All validation completes before any tracing begins.
+"""
+
+ECMP_HELP = """\
+input format (UTF-8 JSON object with exactly five fields):
+  nodes, links, source, destination, packet
+              exactly as in the trace command; every topology and
+              packet constraint applies unchanged
+
+forwarding rules:
+  at each node the candidate next hops are the outgoing links with up
+  == true that can enter a minimum-total-cost path from the current
+  node to the destination; alternatives of a different total cost never
+  participate. Parallel links each occupy a candidate slot. Candidates
+  are ordered by (next node id, link id) in Unicode code point order.
+  Per hop, SHA-256 is computed over the UTF-8 bytes of packet.id, then
+  one zero byte, then the UTF-8 bytes of the current node id; the
+  digest interpreted as a big-endian unsigned integer is taken modulo
+  the candidate count to select the zero-based index. priority, payload
+  and input array order never affect the choice. ttl must be greater
+  than zero before the packet leaves a node and decreases by one per
+  traversed link; arriving at the destination with ttl reduced to zero
+  still counts as delivered. A packet whose ttl is zero before
+  forwarding is dropped at the current node with reason ttl_exhausted.
+  If no route exists, the packet is dropped at the source without
+  traversing any link, with reason no_route. A source equal to its
+  destination is delivered immediately without consuming ttl. At most
+  (node count - 1) hops are possible.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, packet_id, source, destination, path, hops, final_node,
+  ttl_remaining, reason
+  status is "delivered" (reason null) or "dropped" (reason is the
+  unique drop cause). path lists the nodes actually reached; each hop
+  has keys from, to, link, ttl_before, ttl_after, decision,
+  candidate_count, selected_index in this order; decision is always
+  "ecmp_hash", and candidate_count and selected_index record the number
+  of candidates and the hash-selected zero-based index at that hop.
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3), ParameterError (exit code 2) and
+  PacketError (exit code 4) as in trace; stdout is left empty. All
+  validation completes before any tracing begins.
 """
 
 
@@ -441,6 +486,143 @@ def trace_packet(node_ids, links, source, destination, packet_id, ttl):
     return output
 
 
+def ecmp_candidate_table(node_ids, links, destination):
+    """Minimum-cost candidate next hops for every node, keyed by distance.
+
+    Dijkstra is run once on the reversed up-link graph from destination,
+    so dist[v] is the minimum cost v -> destination. An up link u -> v of
+    cost c is a candidate exactly when dist[u] == c + dist[v] (and both
+    ends are finite): taking it enters a minimum-total-cost path. Links of
+    any other total cost are excluded. Full equal-cost paths are never
+    enumerated. Each node's candidates are sorted by (next node id, link
+    id) in Unicode code point order; parallel links each take one slot.
+
+    Returns (dist, candidates), where candidates[u] is a list of
+    (next node index, link id) sorted as above.
+    """
+    node_count = len(node_ids)
+    reverse = [[] for _ in range(node_count)]
+    up_links = []
+    for link_id, u, v, cost, up in links:
+        if up:
+            reverse[v].append((u, cost))
+            up_links.append((link_id, u, v, cost))
+
+    dist = [None] * node_count
+    dist[destination] = 0
+    heap = [(0, destination)]
+    while heap:
+        current, node = heapq.heappop(heap)
+        if current != dist[node]:
+            continue
+        for predecessor, cost in reverse[node]:
+            candidate = current + cost
+            if dist[predecessor] is None or candidate < dist[predecessor]:
+                dist[predecessor] = candidate
+                heapq.heappush(heap, (candidate, predecessor))
+
+    candidates = [[] for _ in range(node_count)]
+    for link_id, u, v, cost in up_links:
+        if dist[u] is not None and dist[v] is not None and dist[u] == cost + dist[v]:
+            candidates[u].append((v, link_id))
+    for entry in candidates:
+        entry.sort(key=lambda item: (node_ids[item[0]], item[1]))
+    return dist, candidates
+
+
+def select_ecmp_index(packet_id, current_node_id, candidate_count):
+    """Hash packet.id and the current node id onto a candidate index.
+
+    SHA-256 over packet.id UTF-8 bytes, one zero byte, then the current
+    node id UTF-8 bytes; the digest as a big-endian unsigned integer is
+    taken modulo the candidate count.
+    """
+    digest = hashlib.sha256()
+    digest.update(packet_id.encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(current_node_id.encode("utf-8"))
+    return int.from_bytes(digest.digest(), "big") % candidate_count
+
+
+def ecmp_trace_packet(node_ids, links, source, destination, packet_id, ttl):
+    """Forward a packet by hashing onto an equal-cost minimum-cost next hop.
+
+    Returns the output object with keys status, packet_id, source,
+    destination, path, hops, final_node, ttl_remaining, reason. Every hop
+    carries keys from, to, link, ttl_before, ttl_after, decision,
+    candidate_count, selected_index, with decision "ecmp_hash".
+    """
+    source_id = node_ids[source]
+    destination_id = node_ids[destination]
+    output = {
+        "status": None,
+        "packet_id": packet_id,
+        "source": source_id,
+        "destination": destination_id,
+        "path": [source_id],
+        "hops": [],
+        "final_node": source_id,
+        "ttl_remaining": ttl,
+        "reason": None,
+    }
+
+    if source == destination:
+        output["status"] = "delivered"
+        return output
+
+    dist, candidates = ecmp_candidate_table(node_ids, links, destination)
+    if dist[source] is None:
+        output["status"] = "dropped"
+        output["reason"] = "no_route"
+        return output
+
+    remaining = ttl
+    current = source
+    hop_budget = len(node_ids) - 1
+    while current != destination:
+        if remaining <= 0:
+            output["status"] = "dropped"
+            output["reason"] = "ttl_exhausted"
+            output["ttl_remaining"] = remaining
+            return output
+        current_candidates = candidates[current]
+        if not current_candidates:
+            output["status"] = "dropped"
+            output["reason"] = "no_route"
+            output["ttl_remaining"] = remaining
+            return output
+        selected = select_ecmp_index(
+            packet_id, node_ids[current], len(current_candidates)
+        )
+        next_node, link_id = current_candidates[selected]
+        next_id = node_ids[next_node]
+        hop = {
+            "from": output["final_node"],
+            "to": next_id,
+            "link": link_id,
+            "ttl_before": remaining,
+            "ttl_after": remaining - 1,
+            "decision": "ecmp_hash",
+            "candidate_count": len(current_candidates),
+            "selected_index": selected,
+        }
+        output["hops"].append(hop)
+        remaining -= 1
+        output["path"].append(next_id)
+        output["final_node"] = next_id
+        current = next_node
+        hop_budget -= 1
+        if hop_budget < 0:
+            output["status"] = "dropped"
+            output["reason"] = "no_route"
+            output["ttl_remaining"] = remaining
+            return output
+
+    output["status"] = "delivered"
+    output["ttl_remaining"] = remaining
+    return output
+
+
 def write_json_line(stream, value):
     stream.write(
         json.dumps(value, separators=(",", ":"), ensure_ascii=False) + "\n"
@@ -482,6 +664,22 @@ def build_parser():
         metavar="PATH",
         help="path to the UTF-8 JSON trace document",
     )
+    ecmp_parser = subparsers.add_parser(
+        "ecmp-trace",
+        help="hash a packet onto an equal-cost next hop at every node",
+        description=(
+            "Trace a packet that is hashed onto an equal-cost "
+            "minimum-cost next hop at every node."
+        ),
+        epilog=ECMP_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ecmp_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON trace document",
+    )
     return parser
 
 
@@ -505,6 +703,16 @@ def main(argv):
             )
             packet_id, ttl, _priority, _payload = validate_packet(document)
             output = trace_packet(
+                node_ids, links, source, destination, packet_id, ttl
+            )
+            write_json_line(sys.stdout, output)
+            return 0
+        if args.command == "ecmp-trace":
+            node_ids, links, source, destination = validate(
+                document, TRACE_ROOT_FIELDS
+            )
+            packet_id, ttl, _priority, _payload = validate_packet(document)
+            output = ecmp_trace_packet(
                 node_ids, links, source, destination, packet_id, ttl
             )
             write_json_line(sys.stdout, output)
