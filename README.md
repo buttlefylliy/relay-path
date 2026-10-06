@@ -54,6 +54,12 @@ TTL、立即送达、`no_route`、`ttl_exhausted`、节点数减一跳上限与 
 
 TTL 衰减、到达时 ttl 为零仍送达、起终点相同时立即送达、`no_route` 与 `ttl_exhausted` 归因、节点数减一跳上限，以及 `ConfigError`（3）、`ParameterError`（2）、`PacketError`（4）和标准流规则均与 `ecmp-trace` 一致。成功时标准输出沿用相同的一行紧凑 JSON 顶层键序；每个 hop 的键依次为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `sticky_ecmp_hash`）、`candidate_count`、`selected_index`、`selected_score`，其中 `selected_score` 为获胜候选摘要的 64 个小写十六进制字符。相同输入逐字节一致，不读墙上时钟，不枚举完整路径，时间上界 O((N+M)log(N+M))，额外内存 O(N+M)。
 
+### `latency-trace --input PATH`
+
+在 `trace` 的根字段之外仅增加 `clock_ms` 和 `latencies`（根对象共七个字段，拒绝其他字段）。`clock_ms` 是 0 至 999999999999.999 的十进制毫秒字符串；`latencies` 是以已声明链路 id 为键、以 0 至 86400000.000 毫秒十进制字符串为值的对象，未列出的链路按 0.000 处理。时间字符串最多含三位小数，不接受指数、符号、空白和非有限值，输出统一补足三位。未知链路键、非法时间、字段缺失或额外字段均输出 `ConfigError`（退出码 3），标准输出为空；端点和报文错误继续使用 `ParameterError`（2）与 `PacketError`（4）。拓扑、端点、报文、起始时间和全部时延完整校验后才计算。
+
+报文仍沿 `trace` 的确定性最小代价路径转发，路径、TTL 和丢弃归因不因时延改变。时间以千分之一毫秒精确累加，不读取墙上时钟：首跳离开时间为 `clock_ms`，后续离开时间为上一跳到达时间，到达时间为离开时间加本链路时延。成功时标准输出沿用 `trace` 的一行紧凑 JSON 顶层键序，在 `reason` 后依次增加 `started_at_ms`、`finished_at_ms`；每个 hop 在既有键后依次增加 `departed_at_ms`、`latency_ms`、`arrived_at_ms`。立即送达、`no_route` 或首节点 `ttl_exhausted` 的完成时间等于开始时间，中途 `ttl_exhausted` 的完成时间等于最后一跳到达时间。相同输入的输出逐字节一致，输出不超过节点数减一跳，时间上界 O((N+M)log(N+M))，额外内存 O(N+M)。既有五个命令的输入、输出、错误和键序保持不变。
+
 ## 状态
 
 仓库初始为空，功能按增量需求持续构建。
