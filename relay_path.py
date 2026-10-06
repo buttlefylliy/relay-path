@@ -14,6 +14,7 @@ Public entry points:
     python relay_path.py queue-trace --input PATH
     python relay_path.py event-trace --input PATH
     python relay_path.py node-event-trace --input PATH
+    python relay_path.py fragment-trace --input PATH
 
 Reads a UTF-8 JSON object describing relay nodes and directed links and
 prints the minimum-cost route from source to destination (route), the
@@ -36,8 +37,10 @@ against an explicit event clock and forwards the packet over the
 effective topology at the query time (event-trace), or a trace that
 replays node failure and recovery events against an explicit event
 clock and forwards the packet over the effective topology at the
-query time (node-event-trace), as one compact JSON
-object on stdout.
+query time (node-event-trace), or a trace that slices the reassembled
+payload into MTU-sized fragments before every successful link
+departure and reassembles at the next node (fragment-trace), as one
+compact JSON object on stdout.
 """
 
 import argparse
@@ -53,6 +56,8 @@ MAX_PACKET_ID_CODEPOINTS = 128
 MAX_PACKET_TTL = 255
 MAX_PACKET_PRIORITY = 7
 MAX_PAYLOAD_BYTES = 65536
+MIN_MTU_BYTES = 1
+MAX_MTU_BYTES = 65536
 MIN_LINK_WEIGHT = 1
 MAX_LINK_WEIGHT = 65535
 MAX_CLOCK_THOUSANDTHS = 999999999999999
@@ -70,6 +75,7 @@ QUEUE_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + (
 )
 EVENT_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("clock_ms", "events")
 NODE_EVENT_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("clock_ms", "events")
+FRAGMENT_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("mtus",)
 PACKET_FIELDS = ("id", "ttl", "priority", "payload")
 STICKY_PACKET_FIELDS = PACKET_FIELDS + ("flow_id",)
 TIME_PATTERN = re.compile(r"[0-9]+(\.[0-9]{1,3})?\Z")
@@ -600,6 +606,53 @@ errors (single compact JSON line on stderr, keys: error, message):
   any event is applied or any tracing begins.
 """
 
+FRAGMENT_HELP = """\
+input format (UTF-8 JSON object with exactly these six fields):
+  nodes, links, source, destination, packet
+              exactly as in the trace command; every topology and
+              packet constraint applies unchanged
+  mtus        object whose keys are every declared link id and whose
+              values are JSON integers in 1..65536 bytes (booleans are
+              not accepted as integers). Every declared link must
+              appear exactly once: a missing link, an unknown link key
+              or an out-of-range MTU is a ConfigError.
+
+forwarding rules:
+  the packet follows the same deterministic minimum-cost route as the
+  trace command; MTUs never influence routing, ttl or drop
+  attribution. Before every successful departure from a node, the
+  UTF-8 byte sequence of packet.payload is treated as the reassembled
+  complete payload and sliced front to back according to the selected
+  link's MTU: every fragment but the last is exactly MTU bytes, the
+  last fragment carries the remainder and is also MTU bytes when the
+  length divides exactly, and an empty payload is fixed to a single
+  zero-length fragment. Slicing may fall inside a multibyte character;
+  fragment contents are neither emitted nor decoded. Fragmentation
+  consumes no extra ttl and never changes the path; the payload is
+  reassembled at the next node and later links fragment by their own
+  MTUs. ttl_exhausted, no_route, a source equal to its destination and
+  arrival with ttl reduced exactly to zero are handled as in trace,
+  and no fragment record is produced for a link that is never
+  attempted. At most (node count - 1) hops are possible.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, packet_id, source, destination, path, hops, final_node,
+  ttl_remaining, reason
+  status is "delivered" (reason null) or "dropped" (reason is the
+  unique drop cause). path lists the nodes actually reached; each hop
+  has keys from, to, link, ttl_before, ttl_after, decision, mtu_bytes,
+  payload_bytes, fragment_count, last_fragment_bytes in this order;
+  decision is always "fragment_forward", and the first
+  fragment_count - 1 fragments are each mtu_bytes long while the last
+  fragment is last_fragment_bytes long.
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3), ParameterError (exit code 2) and
+  PacketError (exit code 4) as in trace; invalid mtus are a
+  ConfigError; stdout is left empty. All validation completes before
+  any tracing begins.
+"""
+
 
 class ConfigError(Exception):
     """The input document is missing, malformed, or violates the schema."""
@@ -972,6 +1025,45 @@ def validate_bandwidths(document, link_ids):
     return resolved
 
 
+def validate_mtus(document, link_ids):
+    """Validate the mtus field; every problem is a ConfigError.
+
+    The object must list every declared link id exactly once with a
+    JSON integer value in 1..65536 bytes (booleans are not integers).
+    Keys are checked in Unicode code point order so the first reported
+    problem is deterministic. Returns a mapping of link id to MTU
+    containing one entry per declared link.
+    """
+    mtus = document["mtus"]
+    if not isinstance(mtus, dict):
+        raise ConfigError("mtus must be an object")
+
+    declared = set(link_ids)
+    listed = set()
+    resolved = {}
+    for link_id in sorted(mtus):
+        if not isinstance(link_id, str):
+            raise ConfigError("mtus keys must be strings")
+        if link_id not in declared:
+            raise ConfigError(
+                "mtus refers to an undeclared link: %s" % link_id
+            )
+        listed.add(link_id)
+        value = mtus[link_id]
+        if type(value) is not int or not MIN_MTU_BYTES <= value <= MAX_MTU_BYTES:
+            raise ConfigError(
+                "mtus[%s] must be an integer in %d..%d"
+                % (link_id, MIN_MTU_BYTES, MAX_MTU_BYTES)
+            )
+        resolved[link_id] = value
+    missing = declared - listed
+    if missing:
+        raise ConfigError(
+            "mtus is missing declared link: %s" % sorted(missing)[0]
+        )
+    return resolved
+
+
 def validate_loss_rates(document, link_ids):
     """Validate the loss_rates field; every problem is a ConfigError.
 
@@ -1302,6 +1394,106 @@ def trace_packet(node_ids, links, source, destination, packet_id, ttl):
             "ttl_before": remaining,
             "ttl_after": remaining - 1,
             "decision": "forward",
+        }
+        output["hops"].append(hop)
+        remaining -= 1
+        output["path"].append(next_id)
+        output["final_node"] = next_id
+
+    output["status"] = "delivered"
+    output["ttl_remaining"] = remaining
+    return output
+
+
+def fragment_division(payload_bytes, mtu):
+    """Describe how a payload is sliced front to back at an MTU.
+
+    Every fragment but the last is exactly mtu bytes; the last carries
+    the remainder and is also mtu bytes when the length divides
+    exactly. An empty payload is a single zero-length fragment. The
+    bytes are never actually sliced or copied and no per-fragment
+    record is built; only (fragment_count, last_fragment_bytes) is
+    returned, both derived in constant time from the byte count.
+    """
+    if payload_bytes == 0:
+        return 1, 0
+    full, remainder = divmod(payload_bytes, mtu)
+    if remainder == 0:
+        return full, mtu
+    return full + 1, remainder
+
+
+def fragment_trace_packet(
+    node_ids, links, source, destination, packet_id, ttl, payload, link_mtus
+):
+    """Forward a packet along the deterministic minimum-cost route,
+    fragmenting the reassembled payload at every successful departure.
+
+    Routing, ttl and drop attribution are exactly as in trace_packet;
+    MTUs never influence the path. Before each successful departure the
+    UTF-8 bytes of packet.payload are treated as the reassembled
+    complete payload and sliced front to back by the selected link's
+    MTU (see fragment_division); slicing may fall inside a multibyte
+    character, fragment contents are never emitted or decoded, and the
+    payload is conceptually reassembled at the next node.
+    Fragmentation consumes no extra ttl, and a link that is never
+    attempted (immediate delivery, no_route, ttl_exhausted) produces no
+    fragment record.
+
+    Returns the output object with keys status, packet_id, source,
+    destination, path, hops, final_node, ttl_remaining, reason. Every
+    hop carries keys from, to, link, ttl_before, ttl_after, decision,
+    mtu_bytes, payload_bytes, fragment_count, last_fragment_bytes, with
+    decision "fragment_forward".
+    """
+    source_id = node_ids[source]
+    destination_id = node_ids[destination]
+    payload_bytes = len(payload.encode("utf-8"))
+    output = {
+        "status": None,
+        "packet_id": packet_id,
+        "source": source_id,
+        "destination": destination_id,
+        "path": [source_id],
+        "hops": [],
+        "final_node": source_id,
+        "ttl_remaining": ttl,
+        "reason": None,
+    }
+
+    if source == destination:
+        output["status"] = "delivered"
+        return output
+
+    route = find_route(node_ids, links, source, destination)
+    if route is None:
+        output["status"] = "dropped"
+        output["reason"] = "no_route"
+        return output
+
+    path, route_links, _total_cost = route
+    remaining = ttl
+    for next_id, link_id in zip(path[1:], route_links):
+        if remaining <= 0:
+            output["status"] = "dropped"
+            output["reason"] = "ttl_exhausted"
+            output["ttl_remaining"] = remaining
+            return output
+        mtu = link_mtus[link_id]
+        fragment_count, last_fragment_bytes = fragment_division(
+            payload_bytes, mtu
+        )
+        hop = {
+            "from": output["final_node"],
+            "to": next_id,
+            "link": link_id,
+            "ttl_before": remaining,
+            "ttl_after": remaining - 1,
+            "decision": "fragment_forward",
+            "mtu_bytes": mtu,
+            "payload_bytes": payload_bytes,
+            "fragment_count": fragment_count,
+            "last_fragment_bytes": last_fragment_bytes,
         }
         output["hops"].append(hop)
         remaining -= 1
@@ -2459,6 +2651,24 @@ def build_parser():
         metavar="PATH",
         help="path to the UTF-8 JSON node event trace document",
     )
+    fragment_parser = subparsers.add_parser(
+        "fragment-trace",
+        help="fragment the payload by per-link MTU on every hop",
+        description=(
+            "Trace a packet along the deterministic minimum-cost route "
+            "and slice the reassembled payload into MTU-sized fragments "
+            "before every successful link departure, reassembling at "
+            "the next node."
+        ),
+        epilog=FRAGMENT_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    fragment_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON fragment trace document",
+    )
     return parser
 
 
@@ -2657,6 +2867,24 @@ def main(argv):
                 ttl,
                 clock_thousandths,
                 events,
+            )
+            write_json_line(sys.stdout, output)
+            return 0
+        if args.command == "fragment-trace":
+            node_ids, links, source, destination = validate(
+                document, FRAGMENT_TRACE_ROOT_FIELDS
+            )
+            packet_id, ttl, _priority, payload = validate_packet(document)
+            link_mtus = validate_mtus(document, [link[0] for link in links])
+            output = fragment_trace_packet(
+                node_ids,
+                links,
+                source,
+                destination,
+                packet_id,
+                ttl,
+                payload,
+                link_mtus,
             )
             write_json_line(sys.stdout, output)
             return 0
