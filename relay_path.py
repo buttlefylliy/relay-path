@@ -9,6 +9,7 @@ Public entry points:
     python relay_path.py weighted-ecmp-trace --input PATH
     python relay_path.py sticky-ecmp-trace --input PATH
     python relay_path.py latency-trace --input PATH
+    python relay_path.py bandwidth-trace --input PATH
     python relay_path.py loss-trace --input PATH
 
 Reads a UTF-8 JSON object describing relay nodes and directed links and
@@ -21,6 +22,8 @@ weighted equal-cost next hop using per-link weights
 the highest-scoring equal-cost next hop (sticky-ecmp-trace), or a trace
 that annotates every hop of the deterministic minimum-cost route with
 departure, link-latency and arrival times (latency-trace), or a trace
+that additionally accounts for per-link serialization delay from the
+packet payload size and link bandwidth (bandwidth-trace), or a trace
 that drops the packet on a link when a deterministic per-hop hash falls
 below that link's configured loss rate (loss-trace), as one compact
 JSON object on stdout.
@@ -48,12 +51,16 @@ ROOT_FIELDS = ("nodes", "links", "source", "destination")
 TRACE_ROOT_FIELDS = ROOT_FIELDS + ("packet",)
 WEIGHTED_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("weights",)
 LATENCY_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("clock_ms", "latencies")
+BANDWIDTH_TRACE_ROOT_FIELDS = LATENCY_TRACE_ROOT_FIELDS + ("bandwidths",)
 LOSS_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("loss_rates",)
 PACKET_FIELDS = ("id", "ttl", "priority", "payload")
 STICKY_PACKET_FIELDS = PACKET_FIELDS + ("flow_id",)
 TIME_PATTERN = re.compile(r"[0-9]+(\.[0-9]{1,3})?\Z")
 LOSS_RATE_PATTERN = re.compile(r"(0\.[0-9]{6}|1\.0{6})\Z")
 MAX_LOSS_UNITS = 1000000
+MIN_LINK_BANDWIDTH = 1
+MAX_LINK_BANDWIDTH = 1000000000000
+SERIALIZATION_SCALE_THOUSANDTHS = 1000000
 
 FORMAT_HELP = """\
 input format (UTF-8 JSON object with exactly these four fields):
@@ -299,6 +306,53 @@ output (single compact JSON line on stdout, keys in this order):
   departed_at_ms, latency_ms, arrived_at_ms in this order, and
   decision is always "forward". All times are decimal millisecond
   strings with exactly three fractional digits.
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3), ParameterError (exit code 2) and
+  PacketError (exit code 4) as in trace; stdout is left empty. All
+  validation completes before any tracing begins.
+"""
+
+BANDWIDTH_HELP = """\
+input format (UTF-8 JSON object with exactly these eight fields):
+  nodes, links, source, destination, packet
+              exactly as in the trace command; every topology and
+              packet constraint applies unchanged
+  clock_ms, latencies
+              exactly as in the latency-trace command; every clock and
+              link latency constraint applies unchanged
+  bandwidths  object whose keys are every declared link id and whose
+              values are JSON integers in 1..1000000000000 bits per
+              second (booleans are not accepted as integers). Every
+              declared link must appear exactly once: a missing link,
+              an unknown link key or an out-of-range bandwidth is a
+              ConfigError.
+
+forwarding rules:
+  the packet follows the same deterministic minimum-cost route as the
+  trace command; neither bandwidth nor latency ever influences the
+  path, ttl or drop attribution. Time is accumulated in thousandths of
+  a millisecond using integer arithmetic and never reads the wall
+  clock. The first hop departs at clock_ms, every later hop departs
+  when the previous hop arrived, and a hop arrives its serialization
+  time plus its link latency after departing. Serialization time is
+  computed from packet.payload's UTF-8 byte count only, with no
+  protocol headers, as ceil(bytes * 8 * 1000000 / bandwidth_bps)
+  thousandths of a millisecond; an empty payload serializes in zero
+  time. Immediate delivery, no_route and ttl_exhausted before the first
+  hop finish at the start time; ttl_exhausted later finishes at the
+  last hop's arrival. At most (node count - 1) hops are possible.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, packet_id, source, destination, path, hops, final_node,
+  ttl_remaining, reason, started_at_ms, finished_at_ms
+  status is "delivered" (reason null) or "dropped" (reason is the
+  unique drop cause). path lists the nodes actually reached; each hop
+  has keys from, to, link, ttl_before, ttl_after, decision,
+  departed_at_ms, bandwidth_bps, serialization_ms, latency_ms,
+  arrived_at_ms in this order, and decision is always "forward". All
+  times are decimal millisecond strings with exactly three fractional
+  digits, and bandwidth_bps is the link's integer bandwidth.
 
 errors (single compact JSON line on stderr, keys: error, message):
   ConfigError (exit code 3), ParameterError (exit code 2) and
@@ -685,6 +739,48 @@ def validate_latencies(document, link_ids):
     return resolved
 
 
+def validate_bandwidths(document, link_ids):
+    """Validate the bandwidths field; every problem is a ConfigError.
+
+    The object must list every declared link id exactly once with a
+    JSON integer value in 1..1000000000000 bits per second (booleans
+    are not integers). Keys are checked in Unicode code point order so
+    the first reported problem is deterministic. Returns a mapping of
+    link id to bandwidth containing one entry per declared link.
+    """
+    bandwidths = document["bandwidths"]
+    if not isinstance(bandwidths, dict):
+        raise ConfigError("bandwidths must be an object")
+
+    declared = set(link_ids)
+    listed = set()
+    resolved = {}
+    for link_id in sorted(bandwidths):
+        if not isinstance(link_id, str):
+            raise ConfigError("bandwidths keys must be strings")
+        if link_id not in declared:
+            raise ConfigError(
+                "bandwidths refers to an undeclared link: %s" % link_id
+            )
+        listed.add(link_id)
+        value = bandwidths[link_id]
+        if (
+            type(value) is not int
+            or not MIN_LINK_BANDWIDTH <= value <= MAX_LINK_BANDWIDTH
+        ):
+            raise ConfigError(
+                "bandwidths[%s] must be an integer in %d..%d"
+                % (link_id, MIN_LINK_BANDWIDTH, MAX_LINK_BANDWIDTH)
+            )
+        resolved[link_id] = value
+    missing = declared - listed
+    if missing:
+        raise ConfigError(
+            "bandwidths is missing declared link: %s" % sorted(missing)[0]
+        )
+    return resolved
+
+
 def validate_loss_rates(document, link_ids):
     """Validate the loss_rates field; every problem is a ConfigError.
 
@@ -926,6 +1022,109 @@ def latency_trace_packet(
             "ttl_after": remaining - 1,
             "decision": "forward",
             "departed_at_ms": format_ms(now),
+            "latency_ms": format_ms(latency),
+            "arrived_at_ms": format_ms(arrived),
+        }
+        output["hops"].append(hop)
+        now = arrived
+        remaining -= 1
+        output["path"].append(next_id)
+        output["final_node"] = next_id
+
+    output["status"] = "delivered"
+    output["ttl_remaining"] = remaining
+    output["finished_at_ms"] = format_ms(now)
+    return output
+
+
+def serialization_thousandths(payload_bytes, bandwidth_bps):
+    """Serialization delay for a payload on a bandwidth-limited link.
+
+    ceil(bytes * 8 * 1000000 / bandwidth_bps) thousandths of a
+    millisecond, using integer arithmetic only; an empty payload is
+    zero. Protocol headers are never counted.
+    """
+    numerator = payload_bytes * 8 * SERIALIZATION_SCALE_THOUSANDTHS
+    if numerator == 0:
+        return 0
+    return (numerator + bandwidth_bps - 1) // bandwidth_bps
+
+
+def bandwidth_trace_packet(
+    node_ids, links, source, destination, packet_id, ttl, payload,
+    start_thousandths, link_latencies, link_bandwidths,
+):
+    """Forward a packet along the deterministic minimum-cost route,
+    stamping every hop with departure, bandwidth, serialization,
+    latency and arrival times.
+
+    Routing, ttl and drop attribution are exactly as in
+    latency_trace_packet; bandwidth and latency never influence the
+    path. Time is accumulated in thousandths of a millisecond with
+    integer arithmetic. The first hop departs at start_thousandths,
+    every later hop departs when the previous hop arrived, and a hop
+    arrives its serialization time plus its link latency after
+    departing. Serialization time depends only on the payload's UTF-8
+    byte count and the link bandwidth.
+
+    Returns the output object with keys status, packet_id, source,
+    destination, path, hops, final_node, ttl_remaining, reason,
+    started_at_ms, finished_at_ms. Every hop carries keys from, to,
+    link, ttl_before, ttl_after, decision, departed_at_ms,
+    bandwidth_bps, serialization_ms, latency_ms, arrived_at_ms, with
+    decision "forward".
+    """
+    source_id = node_ids[source]
+    destination_id = node_ids[destination]
+    payload_bytes = len(payload.encode("utf-8"))
+    output = {
+        "status": None,
+        "packet_id": packet_id,
+        "source": source_id,
+        "destination": destination_id,
+        "path": [source_id],
+        "hops": [],
+        "final_node": source_id,
+        "ttl_remaining": ttl,
+        "reason": None,
+        "started_at_ms": format_ms(start_thousandths),
+        "finished_at_ms": format_ms(start_thousandths),
+    }
+
+    if source == destination:
+        output["status"] = "delivered"
+        return output
+
+    route = find_route(node_ids, links, source, destination)
+    if route is None:
+        output["status"] = "dropped"
+        output["reason"] = "no_route"
+        return output
+
+    path, route_links, _total_cost = route
+    remaining = ttl
+    now = start_thousandths
+    for next_id, link_id in zip(path[1:], route_links):
+        if remaining <= 0:
+            output["status"] = "dropped"
+            output["reason"] = "ttl_exhausted"
+            output["ttl_remaining"] = remaining
+            output["finished_at_ms"] = format_ms(now)
+            return output
+        bandwidth = link_bandwidths[link_id]
+        serialization = serialization_thousandths(payload_bytes, bandwidth)
+        latency = link_latencies.get(link_id, 0)
+        arrived = now + serialization + latency
+        hop = {
+            "from": output["final_node"],
+            "to": next_id,
+            "link": link_id,
+            "ttl_before": remaining,
+            "ttl_after": remaining - 1,
+            "decision": "forward",
+            "departed_at_ms": format_ms(now),
+            "bandwidth_bps": bandwidth,
+            "serialization_ms": format_ms(serialization),
             "latency_ms": format_ms(latency),
             "arrived_at_ms": format_ms(arrived),
         }
@@ -1516,6 +1715,23 @@ def build_parser():
         metavar="PATH",
         help="path to the UTF-8 JSON latency trace document",
     )
+    bandwidth_parser = subparsers.add_parser(
+        "bandwidth-trace",
+        help="stamp every hop with serialization plus latency times",
+        description=(
+            "Trace a packet along the deterministic minimum-cost route "
+            "and stamp every hop with departure, bandwidth, "
+            "serialization, link-latency and arrival times."
+        ),
+        epilog=BANDWIDTH_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    bandwidth_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON bandwidth trace document",
+    )
     loss_parser = subparsers.add_parser(
         "loss-trace",
         help="drop a packet on links whose loss hash falls below the rate",
@@ -1621,6 +1837,34 @@ def main(argv):
                 ttl,
                 start_thousandths,
                 link_latencies,
+            )
+            write_json_line(sys.stdout, output)
+            return 0
+        if args.command == "bandwidth-trace":
+            node_ids, links, source, destination = validate(
+                document, BANDWIDTH_TRACE_ROOT_FIELDS
+            )
+            packet_id, ttl, _priority, payload = validate_packet(document)
+            start_thousandths = parse_time_value(
+                document["clock_ms"], MAX_CLOCK_THOUSANDTHS, "clock_ms"
+            )
+            link_latencies = validate_latencies(
+                document, [link[0] for link in links]
+            )
+            link_bandwidths = validate_bandwidths(
+                document, [link[0] for link in links]
+            )
+            output = bandwidth_trace_packet(
+                node_ids,
+                links,
+                source,
+                destination,
+                packet_id,
+                ttl,
+                payload,
+                start_thousandths,
+                link_latencies,
+                link_bandwidths,
             )
             write_json_line(sys.stdout, output)
             return 0
