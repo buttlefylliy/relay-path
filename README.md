@@ -70,6 +70,14 @@ TTL 衰减、到达时 ttl 为零仍送达、起终点相同时立即送达、`n
 
 成功时标准输出沿用 `trace` 的顶层键序；每个 hop 在前五个字段后依次写入 `decision`、`loss_rate`、`loss_value`：`decision` 成功为 `forward`、丢失为 `drop_loss`，`loss_rate` 固定六位小数，`loss_value` 为 16 个小写十六进制字符。同一输入的输出逐字节一致，输入数组顺序不影响既有选路，时间上界 O((N+M)log(N+M))，额外内存 O(N+M)，最多记录节点数减一条尝试。既有六个命令的输入、输出、错误和键序保持不变。
 
+### `bandwidth-trace --input PATH`
+
+在 `latency-trace` 的根字段之外仅增加 `bandwidths` 一个字段（根对象共八个字段，拒绝其他字段）；拓扑、端点、`packet`、`clock_ms` 与 `latencies` 的语义与 `latency-trace` 完全一致。`bandwidths` 是对象，键必须恰好覆盖全部已声明链路 id：缺少链路或出现未知链路键均为 `ConfigError`；值为 1 到 1000000000000 的 JSON 整数（每秒比特数），布尔值不得冒充整数，越界或重复 JSON 键同样输出 `ConfigError`（退出码 3）。端点与报文错误仍为 `ParameterError`（2）与 `PacketError`（4），错误时标准输出为空；整个输入完整校验后才开始计算。
+
+报文仍沿 `trace` 的确定性最小代价路径转发，带宽与时延都不参与选路，路径、TTL 与丢弃归因不变。时间以千分之一毫秒精确累加，不读墙上时钟，不使用浮点数：首跳离开时间为 `clock_ms`，后续离开时间为上一跳到达时间。每一跳只按 `packet.payload` 的 UTF-8 字节数计算串行化时间，不计协议头，取 `ceil(字节数×8×1000000÷bandwidth_bps)` 千分之一毫秒，空载荷为零；到达时间等于离开时间加串行化时间再加本链路传播时延。立即送达、`no_route` 或首节点 `ttl_exhausted` 的完成时间等于开始时间；中途 `ttl_exhausted` 的完成时间等于最后一跳的到达时间。跳数上限仍为节点数减一，时间上界 O((N+M)log(N+M))，额外内存 O(N+M)。
+
+成功或业务丢弃时标准输出沿用 `latency-trace` 的顶层键序（`status`、`packet_id`、`source`、`destination`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`、`started_at_ms`、`finished_at_ms`）；每个 hop 的键依次为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `forward`）、`departed_at_ms`、`bandwidth_bps`、`serialization_ms`、`latency_ms`、`arrived_at_ms`。所有时间字符串固定三位小数，`bandwidth_bps` 保持整数，使每跳时间可独立复核。同一输入逐字节一致；既有七个命令的输入、输出、错误和键序保持不变。
+
 ## 状态
 
 仓库初始为空，功能按增量需求持续构建。
