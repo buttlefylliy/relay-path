@@ -86,6 +86,14 @@ TTL 衰减、到达时 ttl 为零仍送达、起终点相同时立即送达、`n
 
 成功或业务丢弃时输出一行紧凑 JSON，顶层键序与 `trace` 相同（`status`、`packet_id`、`source`、`destination`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`）；每个 hop 在既有五个字段后依次写入 `decision`、`capacity_bytes`、`queued_bytes_before`、`packet_bytes`、`queued_bytes_after`，`decision` 准入为 `enqueue`、拒绝为 `drop_tail`。拒绝的尝试仍写入 `hops`，但目标节点不加入 `path`，`final_node` 保持发送节点，`ttl_after` 等于 `ttl_before`，状态为 `dropped`、`reason` 为 `queue_tail_drop`。同一输入逐字节一致，时间上界 O((N+M)log(N+M))，额外内存 O(N+M)。既有七个命令的输入、输出、错误和键序保持不变。
 
+### `event-trace --input PATH`
+
+在 `trace` 的根字段之外仅增加 `clock_ms` 与 `events` 两个字段（根对象共七个字段，拒绝其他字段）。`clock_ms` 沿用 `latency-trace` 的毫秒字符串：0 至 999999999999.999 的十进制字符串，最多三位小数，不接受指数、符号、空白和非有限值。`events` 是最多 100000 项的数组，每项只含 `at_ms`、`link`、`up`：`at_ms` 与 `clock_ms` 同格式同范围，`link` 必须引用已声明链路，`up` 必须是 JSON 布尔值；事件按 `at_ms` 非递减排列，同一时刻按数组顺序应用，允许重复设置及随后恢复。时钟或事件的结构、顺序、引用、数量、取值非法，以及字段缺失或额外字段，均输出 `ConfigError`（退出码 3）；拓扑、端点、报文错误仍为 `ConfigError`（3）、`ParameterError`（2）、`PacketError`（4），错误时标准输出为空。拓扑、端点、报文、时钟与全部事件完整校验后才开始计算状态。
+
+重放从各链路在拓扑中声明的初始 `up` 状态开始，只应用 `at_ms` 小于或等于 `clock_ms` 的事件（含等于查询时刻者），晚于查询时刻的合法事件不生效；事件不消耗 TTL，也不读取墙上时钟。随后在由此得到的有效拓扑上沿用 `trace` 的确定性最小代价选路、平局处理、TTL 衰减、到达时 ttl 为零仍送达、立即送达、`no_route` 和 `ttl_exhausted` 语义，故障链路不得参与选路；跳数上限仍为节点数减一。
+
+成功或业务丢弃时输出一行紧凑 JSON，顶层键依次为 `status`、`packet_id`、`source`、`destination`、`clock_ms`、`applied_events`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`。`clock_ms` 与事件时间统一补足三位小数；`applied_events` 只列实际应用的事件并保持输入顺序，每项键依次为 `at_ms`、`link`、`up`；hop 沿用 `trace` 的字段顺序（`from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`），`decision` 固定为 `event_route`。相同输入逐字节一致，处理 E 个事件的额外时间和内存均为 O(E)，总时间上界 O(E+(N+M)log(N+M))。既有八个命令的输入、输出、错误和键序保持不变。
+
 ## 状态
 
 仓库初始为空，功能按增量需求持续构建。

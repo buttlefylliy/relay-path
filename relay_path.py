@@ -12,6 +12,7 @@ Public entry points:
     python relay_path.py bandwidth-trace --input PATH
     python relay_path.py loss-trace --input PATH
     python relay_path.py queue-trace --input PATH
+    python relay_path.py event-trace --input PATH
 
 Reads a UTF-8 JSON object describing relay nodes and directed links and
 prints the minimum-cost route from source to destination (route), the
@@ -29,7 +30,9 @@ that drops the packet on a link when a deterministic per-hop hash falls
 below that link's configured loss rate (loss-trace), or a trace that
 admits the packet to a per-link queue when the queued bytes plus the
 packet bytes fit the link's capacity and tail-drops it otherwise
-(queue-trace), as one compact JSON object on stdout.
+(queue-trace), or a trace that replays explicit link up/down events on a
+clock and forwards along the effective topology at the query time
+(event-trace), as one compact JSON object on stdout.
 """
 
 import argparse
@@ -60,6 +63,7 @@ QUEUE_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + (
     "queue_capacities",
     "queue_occupancies",
 )
+EVENT_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("clock_ms", "events")
 PACKET_FIELDS = ("id", "ttl", "priority", "payload")
 STICKY_PACKET_FIELDS = PACKET_FIELDS + ("flow_id",)
 TIME_PATTERN = re.compile(r"[0-9]+(\.[0-9]{1,3})?\Z")
@@ -69,6 +73,7 @@ MIN_LINK_BANDWIDTH = 1
 MAX_LINK_BANDWIDTH = 1000000000000
 SERIALIZATION_SCALE_THOUSANDTHS = 1000000
 MAX_QUEUE_BYTES = 1000000000000
+MAX_EVENTS = 100000
 
 FORMAT_HELP = """\
 input format (UTF-8 JSON object with exactly these four fields):
@@ -470,6 +475,63 @@ errors (single compact JSON line on stderr, keys: error, message):
   ConfigError (exit code 3), ParameterError (exit code 2) and
   PacketError (exit code 4) as in trace; stdout is left empty. All
   validation completes before any tracing begins.
+"""
+
+EVENT_HELP = """\
+input format (UTF-8 JSON object with exactly seven fields):
+  nodes, links, source, destination, packet
+              exactly as in the trace command; every topology and
+              packet constraint applies unchanged
+  clock_ms    decimal millisecond string in
+              0..999999999999.999 with at most three fractional
+              digits; no exponent, sign, whitespace or non-finite
+              value is accepted
+  events      array of at most 100000 event objects, each with
+              exactly these three fields:
+                at_ms  decimal millisecond string under the same
+                       format and range rules as clock_ms
+                link   id of a declared link
+                up     JSON boolean (booleans are not accepted as
+                       anything else)
+              events must be ordered by at_ms non-decreasing; events
+              at the same at_ms are applied in array order. Repeated
+              settings and later restoration are allowed. A malformed
+              event, an out-of-range or non-ordered at_ms, an
+              undeclared link, a non-boolean up, extra or missing
+              fields and more than 100000 events are ConfigErrors.
+
+forwarding rules:
+  replay starts from every link's declared initial up state and only
+  events with at_ms less than or equal to clock_ms are applied, in
+  input order; valid events later than the query time never take
+  effect. The packet then follows the same deterministic minimum-cost
+  route as the trace command on the resulting effective topology:
+  failed links never participate, events consume no ttl and no wall
+  clock is read. ttl must be greater than zero before the packet
+  leaves a node and decreases by one per traversed link; arriving at
+  the destination with ttl reduced to zero still counts as delivered.
+  A packet whose ttl is zero before forwarding is dropped at the
+  current node with reason ttl_exhausted. If no route exists, the
+  packet is dropped at the source without traversing any link, with
+  reason no_route. A source equal to its destination is delivered
+  immediately without consuming ttl. At most (node count - 1) hops
+  are possible.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, packet_id, source, destination, clock_ms, applied_events,
+  path, hops, final_node, ttl_remaining, reason
+  status is "delivered" (reason null) or "dropped" (reason is the
+  unique drop cause). applied_events lists only the events actually
+  applied (at_ms <= clock_ms) in input order, each with keys at_ms,
+  link, up in this order; every time has exactly three fractional
+  digits. path lists the nodes actually reached; each hop has keys
+  from, to, link, ttl_before, ttl_after, decision in this order, and
+  decision is always "event_route".
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3), ParameterError (exit code 2) and
+  PacketError (exit code 4) as in trace; stdout is left empty. All
+  validation completes before any state is computed.
 """
 
 
@@ -944,6 +1006,59 @@ def validate_queues(document, link_ids):
                 % (link_id, link_id)
             )
     return capacities, occupancies
+
+
+def validate_events(document, link_ids):
+    """Validate the events field; every problem is a ConfigError.
+
+    events must be an array of at most MAX_EVENTS objects, each with
+    exactly the fields at_ms (a decimal millisecond string in the same
+    range as clock_ms), link (a declared link id) and up (a JSON
+    boolean). Events must be ordered by at_ms non-decreasing; events at
+    the same at_ms keep their array order. Problems are reported in
+    array element order so the first reported problem is deterministic.
+    Returns a list of (at_ms in thousandths, link id, up) in input
+    order.
+    """
+    raw_events = document["events"]
+    if not isinstance(raw_events, list):
+        raise ConfigError("events must be an array")
+
+    declared = set(link_ids)
+    events = []
+    previous = None
+    for pos, element in enumerate(raw_events):
+        where = "events[%d]" % pos
+        if not isinstance(element, dict):
+            raise ConfigError("%s must be an object" % where)
+        if set(element) != {"at_ms", "link", "up"}:
+            raise ConfigError(
+                "%s must contain exactly the fields at_ms, link, up" % where
+            )
+        at_ms = parse_time_value(
+            element["at_ms"],
+            MAX_CLOCK_THOUSANDTHS,
+            "%s.at_ms" % where,
+        )
+        link_id = element["link"]
+        if not isinstance(link_id, str):
+            raise ConfigError("%s.link must be a string" % where)
+        if link_id not in declared:
+            raise ConfigError(
+                "%s.link does not refer to a declared link" % where
+            )
+        up = element["up"]
+        if type(up) is not bool:
+            raise ConfigError("%s.up must be a boolean" % where)
+        if previous is not None and at_ms < previous:
+            raise ConfigError(
+                "%s.at_ms precedes the previous event's at_ms" % where
+            )
+        previous = at_ms
+        events.append((at_ms, link_id, up))
+    if len(raw_events) > MAX_EVENTS:
+        raise ConfigError("too many events: limit is %d" % MAX_EVENTS)
+    return events
 
 
 def shortest_distances(node_count, adjacency, source):
@@ -1444,6 +1559,99 @@ def queue_trace_packet(
             output["reason"] = "queue_tail_drop"
             output["ttl_remaining"] = remaining
             return output
+        remaining -= 1
+        output["path"].append(next_id)
+        output["final_node"] = next_id
+
+    output["status"] = "delivered"
+    output["ttl_remaining"] = remaining
+    return output
+
+
+def event_trace_packet(
+    node_ids, links, source, destination, packet_id, ttl,
+    clock_thousandths, events,
+):
+    """Replay link up/down events to the query time, then trace.
+
+    Replay starts from every link's declared initial up state; events
+    are ordered by at_ms non-decreasing, so only the prefix with
+    at_ms <= clock_thousandths is applied, in input order (events at the
+    same at_ms keep array order, and repeated settings are allowed).
+    Events consume no ttl and no wall clock is read. The packet then
+    follows the same deterministic minimum-cost route as trace_packet
+    over the resulting effective topology; failed links never
+    participate.
+
+    Returns the output object with keys status, packet_id, source,
+    destination, clock_ms, applied_events, path, hops, final_node,
+    ttl_remaining, reason. Every applied event carries keys at_ms,
+    link, up in this order, with at_ms formatted to three fractional
+    digits. Every hop carries keys from, to, link, ttl_before,
+    ttl_after, decision, with decision "event_route".
+    """
+    source_id = node_ids[source]
+    destination_id = node_ids[destination]
+
+    is_up = {link_id: up for link_id, _u, _v, _cost, up in links}
+    applied = []
+    for at_ms, link_id, up in events:
+        if at_ms > clock_thousandths:
+            break
+        is_up[link_id] = up
+        applied.append(
+            {
+                "at_ms": format_ms(at_ms),
+                "link": link_id,
+                "up": up,
+            }
+        )
+    effective_links = [
+        (link_id, u, v, cost, is_up[link_id])
+        for link_id, u, v, cost, _up in links
+    ]
+
+    output = {
+        "status": None,
+        "packet_id": packet_id,
+        "source": source_id,
+        "destination": destination_id,
+        "clock_ms": format_ms(clock_thousandths),
+        "applied_events": applied,
+        "path": [source_id],
+        "hops": [],
+        "final_node": source_id,
+        "ttl_remaining": ttl,
+        "reason": None,
+    }
+
+    if source == destination:
+        output["status"] = "delivered"
+        return output
+
+    route = find_route(node_ids, effective_links, source, destination)
+    if route is None:
+        output["status"] = "dropped"
+        output["reason"] = "no_route"
+        return output
+
+    path, route_links, _total_cost = route
+    remaining = ttl
+    for next_id, link_id in zip(path[1:], route_links):
+        if remaining <= 0:
+            output["status"] = "dropped"
+            output["reason"] = "ttl_exhausted"
+            output["ttl_remaining"] = remaining
+            return output
+        hop = {
+            "from": output["final_node"],
+            "to": next_id,
+            "link": link_id,
+            "ttl_before": remaining,
+            "ttl_after": remaining - 1,
+            "decision": "event_route",
+        }
+        output["hops"].append(hop)
         remaining -= 1
         output["path"].append(next_id)
         output["final_node"] = next_id
@@ -1982,6 +2190,23 @@ def build_parser():
         metavar="PATH",
         help="path to the UTF-8 JSON queue trace document",
     )
+    event_parser = subparsers.add_parser(
+        "event-trace",
+        help="replay link up/down events and trace at the query time",
+        description=(
+            "Replay explicit link up/down events on a clock and trace a "
+            "packet hop by hop on the effective topology at the query "
+            "time."
+        ),
+        epilog=EVENT_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    event_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON event trace document",
+    )
     return parser
 
 
@@ -2138,6 +2363,27 @@ def main(argv):
                 payload,
                 queue_capacities,
                 queue_occupancies,
+            )
+            write_json_line(sys.stdout, output)
+            return 0
+        if args.command == "event-trace":
+            node_ids, links, source, destination = validate(
+                document, EVENT_TRACE_ROOT_FIELDS
+            )
+            packet_id, ttl, _priority, _payload = validate_packet(document)
+            clock_thousandths = parse_time_value(
+                document["clock_ms"], MAX_CLOCK_THOUSANDTHS, "clock_ms"
+            )
+            events = validate_events(document, [link[0] for link in links])
+            output = event_trace_packet(
+                node_ids,
+                links,
+                source,
+                destination,
+                packet_id,
+                ttl,
+                clock_thousandths,
+                events,
             )
             write_json_line(sys.stdout, output)
             return 0
