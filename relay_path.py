@@ -29,6 +29,7 @@ Public entry points:
     python relay_path.py replay-priority-summary --input PATH
     python relay_path.py replay-flow-summary --input PATH
     python relay_path.py replay-damped-trace --input PATH
+    python relay_path.py replay-queue-trace --input PATH
 
 Reads a UTF-8 JSON object describing relay nodes and directed links and
 prints the minimum-cost route from source to destination (route), an
@@ -99,7 +100,11 @@ drops, drop reasons and completed traversals for each flow
 every link event must survive a stabilization hold-down period
 before it takes effect, suppressing events overturned during the
 wait, and traces many packets in array order over the effective
-topology (replay-damped-trace), as
+topology (replay-damped-trace), or a replay that walks one time line
+tracing many packets in array order while every link's queue keeps
+changing and is shared across packets, each attempt first serving the
+link from its service budget and then enqueuing the payload bytes or
+tail-dropping the packet (replay-queue-trace), as
 one compact JSON object on stdout.
 """
 
@@ -155,6 +160,12 @@ REPLAY_DAMPED_TRACE_ROOT_FIELDS = ROOT_FIELDS + (
     "hold_down_ms",
     "events",
     "packets",
+)
+REPLAY_QUEUE_TRACE_ROOT_FIELDS = ROOT_FIELDS + (
+    "packets",
+    "queue_capacities",
+    "queue_occupancies",
+    "service_budgets",
 )
 PACKET_FIELDS = ("id", "ttl", "priority", "payload")
 REPLAY_PACKET_ENTRY_FIELDS = ("at_ms", "packet")
@@ -1582,6 +1593,94 @@ errors (single compact JSON line on stderr, keys: error, message):
   destination, and PacketError (exit code 4) for an invalid nested
   packet; stdout is left empty with no partial results. All
   validation completes before the replay begins.
+"""
+
+REPLAY_QUEUE_TRACE_HELP = """\
+input format (UTF-8 JSON object with exactly these eight fields):
+  nodes, links, source, destination
+              exactly as in the route command; all topology and
+              endpoint constraints apply unchanged
+  packets     array of at most 10000 entries, exactly as in the
+              replay-trace command, each with exactly the fields:
+                at_ms   decimal millisecond string under the same
+                        format and range rules as an event at_ms; the
+                        entries must be ordered by non-decreasing
+                        at_ms and entries at the same time run in
+                        array order
+                packet  the four-field trace packet object (id,
+                        ttl, priority, payload) with every trace
+                        packet constraint unchanged
+              an empty array is allowed; the initial occupancies are
+              then reported unchanged.
+  queue_capacities
+              object whose keys are every declared link id and whose
+              values are JSON integers in 0..1000000000000 bytes
+              (booleans are not accepted as integers). Every declared
+              link must appear exactly once: a missing link, an
+              unknown link key or an out-of-range value is a
+              ConfigError.
+  queue_occupancies
+              object under the same rules as queue_capacities, giving
+              the bytes already queued on each link before the replay;
+              an occupancy above the same link's capacity is a
+              ConfigError.
+  service_budgets
+              object under the same coverage and value rules as
+              queue_capacities, giving the bytes each link may serve
+              before the enqueue decision of every one of its
+              attempts.
+
+replay rules:
+  the packets are walked on one time line in array order and each is
+  traced along the deterministic minimum-cost route of the static
+  declared topology; queues never influence the path. Unlike
+  queue-trace the per-link occupancies are not independent snapshots:
+  they keep changing and are shared across packets, so bytes enqueued
+  by an earlier packet are seen by every later attempt, including the
+  later links of the same packet's own forwarding. no_route and
+  ttl_exhausted are decided exactly as in trace before any link is
+  attempted; a source equal to its destination is delivered
+  immediately without any queue check, and attempting no link changes
+  no queue. When a link is attempted, its service budget first serves
+  the currently queued bytes, draining at most the budget bytes
+  (serviced_bytes = min(queued bytes, budget)); unused budget is
+  discarded. packet_bytes is the UTF-8 byte count of packet.payload
+  (an empty payload is zero bytes). If the post-service occupancy
+  plus packet_bytes do not exceed the capacity, the new occupancy is
+  stored, the packet reaches the next node and one ttl is consumed;
+  filling the queue exactly still succeeds. Otherwise only the
+  post-service occupancy is stored, the packet is tail dropped at the
+  sending node, no ttl is consumed and the packet stops with reason
+  queue_tail_drop. Bytes already enqueued are never removed when the
+  packet keeps forwarding along later links. At most (node count - 1)
+  successful hops plus one rejected attempt are recorded per packet.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, source, destination, results, queues
+  status is always "queue_replayed". results corresponds to packets
+  one to one; each entry has keys at_ms, status, packet_id, path,
+  hops, final_node, ttl_remaining, reason in this order. status is
+  "delivered" (reason null) or "dropped" (reason is the unique drop
+  cause). path lists the nodes actually reached; each hop has keys
+  from, to, link, ttl_before, ttl_after, decision, capacity_bytes,
+  queued_bytes_before, serviced_bytes, packet_bytes,
+  queued_bytes_after in this order; decision is "queue_enqueue" for
+  an admitted attempt and "drop_queue_tail" for a rejected one. A
+  rejected attempt is recorded in hops, but its target node is not
+  added to path, final_node stays at the sending node, ttl_after
+  equals ttl_before, and the packet stops with reason
+  queue_tail_drop. queues lists every declared link exactly once,
+  ordered by link id in Unicode code point order, each entry with
+  keys link and occupancy_bytes giving the final occupancy; an empty
+  packets array keeps the initial occupancies.
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3) for bad root fields, topology, packet
+  times or ordering, or queue configuration, ParameterError
+  (exit code 2) for an undeclared source or destination, and
+  PacketError (exit code 4) for an invalid nested packet; stdout is
+  left empty with no partial results. All validation completes
+  before the replay begins.
 """
 
 
@@ -5116,6 +5215,159 @@ def replay_damped_trace_packets(
     }
 
 
+def replay_queue_single_packet(
+    node_ids, links, source, destination, at_thousandths,
+    packet_id, ttl, payload, capacities, budgets, occupancies,
+):
+    """Trace one replay-queue packet over the static minimum-cost route,
+    sharing the mutable per-link queue state with every other packet.
+
+    Routing, ttl and drop attribution are exactly as in trace_packet;
+    queues never influence the path. occupancies maps each link id to
+    its current queued bytes and is mutated in place, so state is kept
+    across packets and links: every attempt first serves the link from
+    its per-link budget, draining at most the budget bytes, and then
+    enqueues packet_bytes (the UTF-8 byte count of the payload). An
+    attempt is admitted exactly when the post-service occupancy plus
+    packet_bytes do not exceed the capacity (filling the queue
+    exactly still succeeds): the new occupancy is stored, the packet
+    reaches the next node and one ttl is consumed. Otherwise only the
+    post-service occupancy is stored, the packet is tail dropped at the
+    sending node, no ttl is consumed and the trace stops with reason
+    queue_tail_drop. Bytes already enqueued are never removed when the
+    packet keeps forwarding along later links. Attempting no link
+    (immediate delivery, no_route, ttl_exhausted) changes no queue.
+
+    Returns the per-packet result object with keys at_ms, status,
+    packet_id, path, hops, final_node, ttl_remaining, reason. Every hop
+    carries keys from, to, link, ttl_before, ttl_after, decision,
+    capacity_bytes, queued_bytes_before, serviced_bytes, packet_bytes,
+    queued_bytes_after, with decision "queue_enqueue" or
+    "drop_queue_tail".
+    """
+    source_id = node_ids[source]
+    destination_id = node_ids[destination]
+    payload_bytes = len(payload.encode("utf-8"))
+    result = {
+        "at_ms": format_ms(at_thousandths),
+        "status": None,
+        "packet_id": packet_id,
+        "path": [source_id],
+        "hops": [],
+        "final_node": source_id,
+        "ttl_remaining": ttl,
+        "reason": None,
+    }
+
+    if source == destination:
+        result["status"] = "delivered"
+        return result
+
+    route = find_route(node_ids, links, source, destination)
+    if route is None:
+        result["status"] = "dropped"
+        result["reason"] = "no_route"
+        return result
+
+    path, route_links, _total_cost = route
+    remaining = ttl
+    for next_id, link_id in zip(path[1:], route_links):
+        if remaining <= 0:
+            result["status"] = "dropped"
+            result["reason"] = "ttl_exhausted"
+            result["ttl_remaining"] = remaining
+            return result
+        capacity = capacities[link_id]
+        budget = budgets[link_id]
+        queued_before = occupancies[link_id]
+        serviced_bytes = min(queued_before, budget)
+        queued_serviced = queued_before - serviced_bytes
+        admitted = queued_serviced + payload_bytes <= capacity
+        queued_after = (
+            queued_serviced + payload_bytes if admitted else queued_serviced
+        )
+        occupancies[link_id] = queued_after
+        hop = {
+            "from": result["final_node"],
+            "to": next_id,
+            "link": link_id,
+            "ttl_before": remaining,
+            "ttl_after": remaining - 1 if admitted else remaining,
+            "decision": "queue_enqueue" if admitted else "drop_queue_tail",
+            "capacity_bytes": capacity,
+            "queued_bytes_before": queued_before,
+            "serviced_bytes": serviced_bytes,
+            "packet_bytes": payload_bytes,
+            "queued_bytes_after": queued_after,
+        }
+        result["hops"].append(hop)
+        if not admitted:
+            result["status"] = "dropped"
+            result["reason"] = "queue_tail_drop"
+            result["ttl_remaining"] = remaining
+            return result
+        remaining -= 1
+        result["path"].append(next_id)
+        result["final_node"] = next_id
+
+    result["status"] = "delivered"
+    result["ttl_remaining"] = remaining
+    return result
+
+
+def replay_queue_trace_packets(
+    node_ids, links, source, destination, packets,
+    capacities, occupancies, budgets,
+):
+    """Replay many packets on one time line against per-link queues
+    whose occupancies keep changing and are shared by every link
+    attempt of every packet.
+
+    Packets are non-decreasing in time and equal times run in array
+    order; no topology events exist, so the static declared topology
+    applies to every packet. The initial occupancies come from the
+    input document and each attempt mutates the shared state via
+    replay_queue_single_packet. Results correspond to the packets one
+    to one; an empty packets array leaves the initial occupancies in
+    place and they are still reported.
+
+    Returns the output object with keys status, source, destination,
+    results, queues. status is "queue_replayed". queues lists every
+    declared link once, ordered by link id in Unicode code point order,
+    each entry with keys link and occupancy_bytes giving the final
+    occupancy.
+    """
+    results = []
+    for at, packet_id, ttl, _priority, payload in packets:
+        results.append(
+            replay_queue_single_packet(
+                node_ids,
+                links,
+                source,
+                destination,
+                at,
+                packet_id,
+                ttl,
+                payload,
+                capacities,
+                budgets,
+                occupancies,
+            )
+        )
+
+    queues = [
+        {"link": link_id, "occupancy_bytes": occupancies[link_id]}
+        for link_id in sorted(occupancies)
+    ]
+    return {
+        "status": "queue_replayed",
+        "source": node_ids[source],
+        "destination": node_ids[destination],
+        "results": results,
+        "queues": queues,
+    }
+
+
 def ecmp_candidate_table(node_ids, links, destination):
     """Minimum-cost candidate next hops for every node, keyed by distance.
 
@@ -6078,6 +6330,25 @@ def build_parser():
         metavar="PATH",
         help="path to the UTF-8 JSON replay trace document",
     )
+    replay_queue_parser = subparsers.add_parser(
+        "replay-queue-trace",
+        help="replay many packets sharing continuously changing per-link queues",
+        description=(
+            "Replay many packets on one time line, tracing each along "
+            "the deterministic minimum-cost route while every link's "
+            "queue keeps changing and is shared across packets: each "
+            "attempt first serves the link from its service budget and "
+            "then enqueues the payload bytes or tail-drops the packet."
+        ),
+        epilog=REPLAY_QUEUE_TRACE_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    replay_queue_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON replay queue trace document",
+    )
     return parser
 
 
@@ -6522,6 +6793,29 @@ def main(argv):
                 hold_thousandths,
                 events,
                 packets,
+            )
+            write_json_line(sys.stdout, output)
+            return 0
+        if args.command == "replay-queue-trace":
+            node_ids, links, source, destination = validate(
+                document, REPLAY_QUEUE_TRACE_ROOT_FIELDS
+            )
+            packets = validate_replay_packets(document)
+            queue_capacities, queue_occupancies = validate_queues(
+                document, [link[0] for link in links]
+            )
+            service_budgets = validate_queue_bytes(
+                document, "service_budgets", [link[0] for link in links]
+            )
+            output = replay_queue_trace_packets(
+                node_ids,
+                links,
+                source,
+                destination,
+                packets,
+                queue_capacities,
+                queue_occupancies,
+                service_budgets,
             )
             write_json_line(sys.stdout, output)
             return 0
