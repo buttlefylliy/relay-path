@@ -182,6 +182,14 @@ TTL 衰减、到达时 ttl 为零仍送达、起终点相同时立即送达、`n
 
 成功时标准输出一行紧凑 JSON，顶层键依次为 `status`、`source`、`destination`、`events`、`packet_count`、`delivered_count`、`dropped_count`、`drop_reasons`、`nodes`。`status` 固定为 `node_summarized`；`events` 保持输入顺序完整回显，每项键依次为 `at_ms`、`target_type`、`target`、`up`，时间补足三位小数；`delivered_count` 与 `dropped_count` 之和等于 `packet_count`；`drop_reasons` 固定依次包含 `node_down`、`no_route`、`ttl_exhausted`，三项整数之和等于 `dropped_count`；`nodes` 包含全部声明节点且只出现一次，按节点 id 的 Unicode 码点序排列，每项键依次为 `node`、`visits`、`arrivals`、`departures`、`delivered`、`dropped`、`drop_reasons`，内层 `drop_reasons` 同样固定按 `node_down`、`no_route`、`ttl_exhausted` 排列。空 `packets` 产生全零总数、原因和节点计数。相同输入逐字节一致，不读墙上时钟，不写文件；设事件数、报文数、节点数、链路数和成功跳数为 E、Q、N、M、H，时间上界为 O(E+Q(N+M)log(N+M)+H+NlogN)，除输出外额外内存为 O(E+N+M+Q+H)。既有命令的公开行为保持不变。
 
+### `replay-priority-summary --input PATH`
+
+输入与 `replay-trace` 完全相同（`nodes`、`links`、`source`、`destination`、`events`、`packets` 六个字段，拒绝其他字段），全部拓扑、端点、事件与报文约束及错误分类不变：根字段、拓扑、事件与 `packets` 包装结构非法输出 `ConfigError`（退出码 3），未声明端点输出 `ParameterError`（退出码 2），嵌套 `packet` 非法输出 `PacketError`（退出码 4），出错时标准输出为空且无部分结果；拓扑、端点、全部事件和全部报文完整校验后才生成汇总。
+
+回放规则与 `replay-trace` 完全一致：各节点初始可用，各链路从声明的 `up` 状态开始，同一时刻先按数组顺序应用全部事件再按数组顺序处理该时刻的报文，每个报文只受不晚于自身时间的事件影响，并在当时有效拓扑上独立执行最小代价选路、状态覆盖、TTL 衰减与 `node_down`、`no_route`、`ttl_exhausted` 归因。不同之处在于不输出逐跳记录，而是按 `packet.priority` 的 0 至 7 八个取值汇总整条时间线：每个报文只计入自身优先级桶；送达或丢弃分别增加该桶的 `delivered_count` 或 `dropped_count`，丢弃时同时增加该桶对应原因计数；每个已完成的 hop 增加该桶的 `traversals`。未发生的跳不计数：立即送达与首跳前丢弃的 `traversals` 为零，中途 TTL 耗尽只统计此前完成的跳。晚到事件仍完整回显，空 `packets` 合法并产生全零汇总。
+
+成功时标准输出一行紧凑 JSON，顶层键依次为 `status`、`source`、`destination`、`events`、`packet_count`、`delivered_count`、`dropped_count`、`drop_reasons`、`priorities`。`status` 固定为 `priority_summarized`；`events` 沿用 `replay-trace` 的回显与时间格式；`delivered_count` 与 `dropped_count` 之和等于 `packet_count`；`drop_reasons` 固定依次包含 `node_down`、`no_route`、`ttl_exhausted`，三项整数之和等于 `dropped_count`。`priorities` 固定按 0 到 7 输出八项，每项键依次为 `priority`、`packet_count`、`delivered_count`、`dropped_count`、`drop_reasons`、`traversals`，内层 `drop_reasons` 同样固定按 `node_down`、`no_route`、`ttl_exhausted` 排列；各桶的报文数、送达数、丢弃数、三种原因数和 traversals 之和分别与总体计数相符。相同输入逐字节一致，不读墙上时钟，不写文件；设事件数、报文数、节点数、链路数和已完成跳数为 E、Q、N、M、H，时间上界为 O(E+Q(N+M)log(N+M)+H)，除输出外额外内存为 O(E+N+M+Q+H)。既有命令的公开行为保持不变。
+
 ## 状态
 
 仓库初始为空，功能按增量需求持续构建。
