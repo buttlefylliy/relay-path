@@ -4,6 +4,7 @@
 Public entry points:
 
     python relay_path.py route --input PATH
+    python relay_path.py explain-route --input PATH
     python relay_path.py trace --input PATH
     python relay_path.py ecmp-trace --input PATH
     python relay_path.py weighted-ecmp-trace --input PATH
@@ -22,7 +23,9 @@ Public entry points:
     python relay_path.py replay-trace --input PATH
 
 Reads a UTF-8 JSON object describing relay nodes and directed links and
-prints the minimum-cost route from source to destination (route), the
+prints the minimum-cost route from source to destination (route), an
+explanation of why each outgoing link along that route was chosen or
+rejected (explain-route), the
 hop-by-hop forwarding trace of a packet along that route (trace), a
 trace that hashes the packet onto an equal-cost minimum-cost next hop at
 every node (ecmp-trace), or a trace that hashes the packet onto a
@@ -167,6 +170,47 @@ output (single compact JSON line on stdout, keys in this order):
 errors (single compact JSON line on stderr, keys: error, message):
   ConfigError (exit code 3) for unreadable/invalid input or bad schema;
   ParameterError (exit code 2) when source or destination is not declared.
+"""
+
+EXPLAIN_HELP = """\
+input format (UTF-8 JSON object with exactly these four fields):
+  nodes, links, source, destination
+              exactly as in the route command; all route constraints
+              on the topology apply unchanged
+
+explanation rules:
+  only the static topology is explained: no packet, event or clock is
+  involved. The first six output keys are exactly the route result for
+  the same input. decisions holds one entry per node of path except
+  the destination, in path order, each with keys node, chosen_link,
+  chosen_to, remaining_cost, candidates in this order; remaining_cost
+  is the minimum total cost from that node to the destination.
+  candidates lists every outgoing link of the node, ordered by (next
+  node id, link id) in Unicode code point order, each with keys link,
+  to, link_cost, suffix_cost, total_cost, outcome in this order. When
+  the link is up and its target can reach the destination, suffix_cost
+  is the minimum cost from the target to the destination and
+  total_cost is link_cost plus suffix_cost; otherwise both are null.
+  outcome is one of selected (the link route actually takes; exactly
+  one per decision, and chosen_link and chosen_to correspond to it),
+  link_down (the link is not up), no_suffix_route (the target cannot
+  reach the destination), higher_cost (total_cost exceeds the node's
+  remaining_cost) and tie_break_lost (total_cost equals remaining_cost
+  but the link loses route's (next node id, link id) tie break). A
+  source equal to its destination yields the zero-cost route result
+  with an empty decisions. When no route exists the unreachable route
+  result is kept and decisions holds only the source entry with
+  chosen_link, chosen_to and remaining_cost all null, its candidates
+  classified as above with none selected.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, source, destination, path, links, total_cost, decisions
+  the first six keys are exactly the route output for the same input.
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3) and ParameterError (exit code 2) as in
+  route; stdout is left empty. All validation completes before any
+  result is produced.
 """
 
 TRACE_HELP = """\
@@ -3845,6 +3889,125 @@ def sticky_ecmp_trace_packet(
     return output
 
 
+def explain_route(node_ids, links, source, destination):
+    """Explain why each outgoing link along the deterministic
+    minimum-cost route was chosen or rejected.
+
+    Only the static topology is considered. The first six output keys
+    (status, source, destination, path, links, total_cost) are exactly
+    the route result for the same input, produced by find_route.
+    decisions holds one entry per node of path except the destination,
+    in path order; each entry records the node, the chosen link and
+    next node, the minimum remaining cost from that node to the
+    destination, and every outgoing link of the node as a candidate
+    sorted by (next node id, link id) in Unicode code point order. A
+    candidate's suffix_cost is the minimum cost from its target to the
+    destination (one reverse Dijkstra, shared with the ECMP candidate
+    table) and total_cost their sum; both are null when the link is
+    down or its target cannot reach the destination. outcome is
+    "selected" for the link route actually takes (exactly one per
+    decision), "link_down" for a down link, "no_suffix_route" when the
+    target cannot reach the destination, "higher_cost" when the total
+    cost exceeds the node's remaining cost, and "tie_break_lost" for
+    an equal-cost link that loses route's (next node id, link id) tie
+    break. The first equal-cost candidate in the sorted order is
+    exactly route's greedy pick, so chosen_link and chosen_to always
+    correspond to the selected candidate.
+
+    When no route exists the unreachable route result is kept and
+    decisions holds only the source entry with chosen_link, chosen_to
+    and remaining_cost all null; every candidate is then link_down or
+    no_suffix_route (an up link whose target reached the destination
+    would make the source itself reachable), so none is selected. A
+    source equal to its destination yields the zero-cost route result
+    with an empty decisions. Full path sets are never enumerated.
+
+    Returns the output object with keys status, source, destination,
+    path, links, total_cost, decisions.
+    """
+    source_id = node_ids[source]
+    destination_id = node_ids[destination]
+    output = {
+        "status": None,
+        "source": source_id,
+        "destination": destination_id,
+        "path": [],
+        "links": [],
+        "total_cost": None,
+        "decisions": [],
+    }
+
+    if source == destination:
+        output["status"] = "found"
+        output["path"] = [source_id]
+        output["total_cost"] = 0
+        return output
+
+    node_count = len(node_ids)
+    outgoing = [[] for _ in range(node_count)]
+    for link_id, u, v, cost, up in links:
+        outgoing[u].append((link_id, v, cost, up))
+
+    dist, _equal_cost = ecmp_candidate_table(node_ids, links, destination)
+    route = find_route(node_ids, links, source, destination)
+
+    def build_decision(node):
+        remaining = dist[node]
+        candidates = []
+        chosen_link = None
+        chosen_to = None
+        ordered = sorted(
+            outgoing[node], key=lambda item: (node_ids[item[1]], item[0])
+        )
+        for link_id, nxt, cost, up in ordered:
+            suffix = dist[nxt] if up else None
+            total = cost + suffix if suffix is not None else None
+            if not up:
+                outcome = "link_down"
+            elif suffix is None:
+                outcome = "no_suffix_route"
+            elif total > remaining:
+                outcome = "higher_cost"
+            elif chosen_link is None:
+                outcome = "selected"
+                chosen_link = link_id
+                chosen_to = node_ids[nxt]
+            else:
+                outcome = "tie_break_lost"
+            candidates.append(
+                {
+                    "link": link_id,
+                    "to": node_ids[nxt],
+                    "link_cost": cost,
+                    "suffix_cost": suffix,
+                    "total_cost": total,
+                    "outcome": outcome,
+                }
+            )
+        return {
+            "node": node_ids[node],
+            "chosen_link": chosen_link,
+            "chosen_to": chosen_to,
+            "remaining_cost": remaining,
+            "candidates": candidates,
+        }
+
+    if route is None:
+        output["status"] = "unreachable"
+        output["decisions"].append(build_decision(source))
+        return output
+
+    path, route_links, total_cost = route
+    output["status"] = "found"
+    output["path"] = path
+    output["links"] = route_links
+    output["total_cost"] = total_cost
+    index_of = {node_id: index for index, node_id in enumerate(node_ids)}
+    for node_id in path[:-1]:
+        output["decisions"].append(build_decision(index_of[node_id]))
+    return output
+
+
 def write_json_line(stream, value):
     stream.write(
         json.dumps(value, separators=(",", ":"), ensure_ascii=False) + "\n"
@@ -3868,6 +4031,22 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     route_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON routing document",
+    )
+    explain_parser = subparsers.add_parser(
+        "explain-route",
+        help="explain why each link on the route was chosen or rejected",
+        description=(
+            "Explain why each outgoing link along the deterministic "
+            "minimum-cost route was chosen or rejected."
+        ),
+        epilog=EXPLAIN_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    explain_parser.add_argument(
         "--input",
         required=True,
         metavar="PATH",
@@ -4166,6 +4345,11 @@ def main(argv):
 
     try:
         document = load_document(args.input)
+        if args.command == "explain-route":
+            node_ids, links, source, destination = validate(document)
+            output = explain_route(node_ids, links, source, destination)
+            write_json_line(sys.stdout, output)
+            return 0
         if args.command == "trace":
             node_ids, links, source, destination = validate(
                 document, TRACE_ROOT_FIELDS
