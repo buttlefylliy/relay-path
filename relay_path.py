@@ -6,6 +6,7 @@ Public entry points:
     python relay_path.py route --input PATH
     python relay_path.py explain-route --input PATH
     python relay_path.py trace --input PATH
+    python relay_path.py explain-trace --input PATH
     python relay_path.py ecmp-trace --input PATH
     python relay_path.py weighted-ecmp-trace --input PATH
     python relay_path.py sticky-ecmp-trace --input PATH
@@ -33,6 +34,9 @@ prints the minimum-cost route from source to destination (route), an
 explanation of why each outgoing link along that route was chosen or
 rejected (explain-route), the
 hop-by-hop forwarding trace of a packet along that route (trace), a
+trace that additionally explains the minimum-cost routing decision
+executed at every node that actually forwarded the packet
+(explain-trace), a
 trace that hashes the packet onto an equal-cost minimum-cost next hop at
 every node (ecmp-trace), or a trace that hashes the packet onto a
 weighted equal-cost next hop using per-link weights
@@ -281,6 +285,45 @@ errors (single compact JSON line on stderr, keys: error, message):
   ConfigError (exit code 3) and ParameterError (exit code 2) as in
   route; PacketError (exit code 4) for an invalid packet, with stdout
   left empty. All validation completes before any tracing begins.
+"""
+
+EXPLAIN_TRACE_HELP = """\
+input format (UTF-8 JSON object with exactly these five fields):
+  nodes, links, source, destination, packet
+              exactly as in the trace command; every topology and
+              packet constraint applies unchanged
+
+explanation rules:
+  the packet is forwarded exactly as in the trace command: the same
+  deterministic minimum-cost route, the same ttl rules and the same
+  drop attribution. The first nine output keys are exactly the trace
+  result for the same input. decisions holds one entry per node where
+  a routing decision was actually executed, in execution order; each
+  entry has keys node, chosen_link, chosen_to, remaining_cost,
+  candidates in this order with exactly the explain-route semantics,
+  the candidates ordered by (next node id, link id) in Unicode code
+  point order and classified with the same five outcomes selected,
+  link_down, no_suffix_route, higher_cost and tie_break_lost. Every
+  successful hop corresponds to exactly one decision whose selected
+  candidate matches the hop's link and next node. When no route
+  exists, decisions holds only the source entry with chosen_link,
+  chosen_to and remaining_cost all null, explaining the no_route
+  drop. A source equal to its destination is delivered immediately
+  with an empty decisions. A ttl of zero before forwarding executes
+  no routing at the current node, so decisions only covers the nodes
+  of the hops that actually happened; arriving at the destination
+  with ttl reduced to zero still counts as delivered.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, packet_id, source, destination, path, hops, final_node,
+  ttl_remaining, reason, decisions
+  the first nine keys are exactly the trace output for the same
+  input.
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3), ParameterError (exit code 2) and
+  PacketError (exit code 4) as in trace; stdout is left empty. All
+  validation completes before any result is produced.
 """
 
 ECMP_HELP = """\
@@ -5210,6 +5253,46 @@ def explain_route(node_ids, links, source, destination):
     return output
 
 
+def explain_trace_packet(
+    node_ids, links, source, destination, packet_id, ttl
+):
+    """Explain the minimum-cost routing decisions a packet executed.
+
+    The first nine output keys are exactly the trace result for the
+    same input, produced by trace_packet; the forwarding result, ttl
+    rules and drop attribution are unchanged. decisions holds one
+    entry per node where a routing decision was actually executed, in
+    execution order, each entry following explain_route's node,
+    chosen_link, chosen_to, remaining_cost, candidates semantics and
+    key order. Every successful hop corresponds to exactly one
+    decision whose selected candidate matches the hop's link and next
+    node. When no route exists, decisions holds only the source's
+    no-choice entry, explaining the no_route drop; a source equal to
+    its destination is delivered immediately with an empty decisions,
+    and a ttl of zero before forwarding executes no routing at the
+    current node, so decisions only covers the hops that actually
+    happened.
+
+    Returns the output object with keys status, packet_id, source,
+    destination, path, hops, final_node, ttl_remaining, reason,
+    decisions.
+    """
+    output = trace_packet(node_ids, links, source, destination, packet_id, ttl)
+    explanation = explain_route(node_ids, links, source, destination)
+    decision_by_node = {
+        decision["node"]: decision for decision in explanation["decisions"]
+    }
+    decisions = []
+    if source != destination:
+        if output["reason"] == "no_route":
+            decisions.append(decision_by_node[node_ids[source]])
+        else:
+            for hop in output["hops"]:
+                decisions.append(decision_by_node[hop["from"]])
+    output["decisions"] = decisions
+    return output
+
+
 def write_json_line(stream, value):
     stream.write(
         json.dumps(value, separators=(",", ":"), ensure_ascii=False) + "\n"
@@ -5262,6 +5345,23 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     trace_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON trace document",
+    )
+    explain_trace_parser = subparsers.add_parser(
+        "explain-trace",
+        help="explain the routing decisions a packet executed",
+        description=(
+            "Trace a packet hop by hop toward the destination and "
+            "explain the minimum-cost routing decision executed at "
+            "every node that actually forwarded it."
+        ),
+        epilog=EXPLAIN_TRACE_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    explain_trace_parser.add_argument(
         "--input",
         required=True,
         metavar="PATH",
@@ -5671,6 +5771,16 @@ def main(argv):
             )
             packet_id, ttl, _priority, _payload = validate_packet(document)
             output = trace_packet(
+                node_ids, links, source, destination, packet_id, ttl
+            )
+            write_json_line(sys.stdout, output)
+            return 0
+        if args.command == "explain-trace":
+            node_ids, links, source, destination = validate(
+                document, TRACE_ROOT_FIELDS
+            )
+            packet_id, ttl, _priority, _payload = validate_packet(document)
+            output = explain_trace_packet(
                 node_ids, links, source, destination, packet_id, ttl
             )
             write_json_line(sys.stdout, output)

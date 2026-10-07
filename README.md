@@ -36,6 +36,14 @@
 
 成功时标准输出一行紧凑 JSON，键序为 `status`、`packet_id`、`source`、`destination`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`；每个 hop 的键序为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `forward`）。送达时 `reason` 为 null，标准错误为空。
 
+### `explain-trace --input PATH`
+
+输入与 `trace` 完全相同（`nodes`、`links`、`source`、`destination`、`packet` 五个字段，packet 约束与校验顺序不变）；`route`、`explain-route`、`trace` 及其他既有命令的输入、输出与错误语义保持不变。报文沿 `trace` 的确定性最小代价路径逐跳转发，转发结果、TTL 规则与丢弃归因与 `trace` 完全一致。
+
+成功或业务丢弃时输出一行紧凑 JSON，顶层键依次为 `status`、`packet_id`、`source`、`destination`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`、`decisions`，前九项与同一输入的 `trace` 输出逐项一致。`decisions` 按实际执行选路的节点顺序排列，每项沿用 `explain-route` 的 `node`、`chosen_link`、`chosen_to`、`remaining_cost`、`candidates` 语义与键序；候选仍按（目标节点 id、链路 id）的 Unicode 码点序排列，并用 `selected`、`link_down`、`no_suffix_route`、`higher_cost`、`tie_break_lost` 五种 outcome 给出唯一分类。每个成功 hop 恰好对应一项含 `selected` 候选的决策，所选链路和下一节点与该 hop 一致。无路可达时 `decisions` 只保留 source 的一项无选择决策（`chosen_link`、`chosen_to`、`remaining_cost` 均为 null）来解释 `no_route`；source 等于 destination 时直接送达且 `decisions` 为空；转发前 ttl 为零时不在当前节点执行选路，`decisions` 只保留此前成功 hop 对应的决策；到达 destination 时 ttl 恰为零仍正常送达。
+
+错误分类仍为 `ConfigError`（退出码 3）、`ParameterError`（退出码 2）、`PacketError`（退出码 4），错误时标准输出为空；拓扑、端点和完整 packet 全部校验通过后才生成结果，失败不产生部分输出。相同输入逐字节一致，不读墙上时钟、不写文件、不枚举完整路径集合；时间上界 O((N+M)log(N+M))，除输出外额外内存 O(N+M)。
+
 ### `ecmp-trace --input PATH`
 
 输入与 `trace` 完全相同（`nodes`、`links`、`source`、`destination`、`packet` 五个字段，packet 约束与校验顺序不变）；既有 `route`、`trace` 的输入、输出与错误语义保持不变。每个节点仅把 `up` 且能够进入「从当前节点到 destination 的最小总代价路径」的出链作为候选；代价不同的备选不得参与，平行链路各占一个候选位置。候选按（目标节点 id、链路 id）的 Unicode 码点序排列。
