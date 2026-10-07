@@ -26,6 +26,7 @@ Public entry points:
     python relay_path.py replay-node-summary --input PATH
     python relay_path.py replay-priority-summary --input PATH
     python relay_path.py replay-flow-summary --input PATH
+    python relay_path.py replay-damped-trace --input PATH
 
 Reads a UTF-8 JSON object describing relay nodes and directed links and
 prints the minimum-cost route from source to destination (route), an
@@ -87,7 +88,11 @@ reasons and completed traversals for each of the eight packet.priority
 values 0..7 (replay-priority-summary), or a replay that summarizes
 the same time line per packet flow_id, counting packets, deliveries,
 drops, drop reasons and completed traversals for each flow
-(replay-flow-summary), as
+(replay-flow-summary), or a replay that walks one time line where
+every link event must survive a stabilization hold-down period
+before it takes effect, suppressing events overturned during the
+wait, and traces many packets in array order over the effective
+topology (replay-damped-trace), as
 one compact JSON object on stdout.
 """
 
@@ -139,6 +144,11 @@ NODE_EVENT_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("clock_ms", "events")
 TOPOLOGY_EVENT_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("clock_ms", "events")
 FRAGMENT_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("mtus",)
 REPLAY_TRACE_ROOT_FIELDS = ROOT_FIELDS + ("events", "packets")
+REPLAY_DAMPED_TRACE_ROOT_FIELDS = ROOT_FIELDS + (
+    "hold_down_ms",
+    "events",
+    "packets",
+)
 PACKET_FIELDS = ("id", "ttl", "priority", "payload")
 REPLAY_PACKET_ENTRY_FIELDS = ("at_ms", "packet")
 MAX_REPLAY_PACKETS = 10000
@@ -1382,6 +1392,89 @@ errors (single compact JSON line on stderr, keys: error, message):
   invalid flow_id reported as a PacketError; stdout is left empty
   with no partial results. All validation completes before the
   replay begins.
+"""
+
+REPLAY_DAMPED_TRACE_HELP = """\
+input format (UTF-8 JSON object with exactly these seven fields):
+  nodes, links, source, destination
+              exactly as in the route command; all route constraints
+              on the topology apply unchanged
+  hold_down_ms
+              decimal millisecond string in 0..86400000.000 under
+              the same format rules as in the damped-event-trace
+              command: the stabilization wait every link event must
+              survive before it takes effect
+  events      array of at most 100000 link events, exactly as in the
+              event-trace command:
+                at_ms, link (the id of a declared link), up (boolean)
+              events are ordered by non-decreasing at_ms; events at
+              the same time apply in array order, and repeated sets
+              of one link (including later recovery) are allowed.
+  packets     array of at most 10000 entries, exactly as in the
+              replay-trace command, each with exactly the fields:
+                at_ms   decimal millisecond string under the same
+                        format and range rules as an event at_ms; the
+                        entries must be ordered by non-decreasing
+                        at_ms
+                packet  the four-field trace packet object (id,
+                        ttl, priority, payload) with every trace
+                        packet constraint unchanged
+              an empty array is allowed and yields an empty results.
+
+replay rules:
+  every link starts in its declared up state. An event takes effect
+  at at_ms + hold_down_ms. When a later event for the same link
+  arrives before the pending event's effective time, the pending
+  event is suppressed and never takes effect; the later event waits
+  its own hold period, even when it carries the same up value. A
+  later event arriving exactly at the pending event's effective time
+  does not suppress it, and events at the same time are processed in
+  input order. Before each packet, every event arrival not later
+  than its at_ms is observed and every transition whose effective
+  time is not later than its at_ms is applied; later events and
+  transitions never affect it. With hold_down_ms equal to zero every
+  arrived event takes effect immediately in input order and the
+  replay matches replay-trace. Each packet is then traced
+  independently over the effective topology with the trace
+  semantics: a source equal to its destination is delivered
+  immediately without consuming ttl, no_route drops at the source,
+  ttl must be greater than zero before leaving a node and decreases
+  by one per link (arrival at the destination with ttl reduced to
+  zero still counts as delivered), and ttl_exhausted drops at the
+  current node. Applying events consumes no ttl. At most
+  (node count - 1) hops are possible per packet. Replaying never
+  reads the wall clock.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, source, destination, hold_down_ms, events,
+  effective_events, results
+  status is always "damped_replayed". hold_down_ms is rendered with
+  exactly three fractional digits. events echoes every input event
+  in input order, each with keys at_ms, link, up in this order and
+  at_ms rendered with exactly three fractional digits.
+  effective_events lists only the events whose effective time is not
+  later than the last packet's at_ms, in the order they took effect,
+  each with keys at_ms, effective_at_ms, link, up in this order and
+  both times rendered with exactly three fractional digits; an empty
+  packets array yields an empty effective_events. results
+  corresponds to packets one to one; each entry has keys at_ms,
+  effective_event_cursor, status, packet_id, path, hops, final_node,
+  ttl_remaining, reason in this order. effective_event_cursor is the
+  number of events that took effect before the packet, i.e. the
+  count of transitions whose effective time is less than or equal to
+  that packet's at_ms. status is "delivered" (reason null) or
+  "dropped" (reason is the unique drop cause). path lists the nodes
+  actually reached; each hop has keys from, to, link, ttl_before,
+  ttl_after, decision in this order, and decision is always
+  "damped_replay_route".
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3) for bad root fields, topology,
+  hold_down_ms, events or packet-entry structure, times or ordering,
+  ParameterError (exit code 2) for an undeclared source or
+  destination, and PacketError (exit code 4) for an invalid nested
+  packet; stdout is left empty with no partial results. All
+  validation completes before the replay begins.
 """
 
 
@@ -4422,6 +4515,211 @@ def replay_flow_summary(node_ids, links, source, destination, events, packets):
     }
 
 
+def replay_damped_transitions(events, hold_thousandths, clock_thousandths):
+    """Compute the damped link transitions observable up to the clock.
+
+    The suppression rules are exactly as in apply_damped_events: only
+    events with at_ms less than or equal to clock_thousandths are
+    observed, an observed event takes effect at at_ms +
+    hold_thousandths unless a later same-link event arrives strictly
+    before that effective time, and a later event arriving exactly at
+    the pending event's effective time does not suppress it. Returns
+    (arrived, transitions), where arrived holds the observed (at,
+    link, up) events in input order and transitions holds
+    (effective_at, arrived index, link, up) tuples for the events
+    that take effect, sorted by effective time and then arrival
+    index. Because every event shares one hold period, effective
+    times are non-decreasing in arrival order, so the transition
+    order is also the arrival order.
+    """
+    arrived = []
+    for at, link_id, up in events:
+        if at > clock_thousandths:
+            break
+        arrived.append((at, link_id, up))
+
+    pending = {}
+    takes_effect = [False] * len(arrived)
+    for index, (at, link_id, _up) in enumerate(arrived):
+        previous = pending.get(link_id)
+        if previous is not None:
+            previous_effective, previous_index = previous
+            if previous_effective <= at:
+                takes_effect[previous_index] = True
+        pending[link_id] = (at + hold_thousandths, index)
+    for link_id, (effective_at, index) in pending.items():
+        if effective_at <= clock_thousandths:
+            takes_effect[index] = True
+
+    transitions = sorted(
+        (
+            arrived[index][0] + hold_thousandths,
+            index,
+            arrived[index][1],
+            arrived[index][2],
+        )
+        for index in range(len(arrived))
+        if takes_effect[index]
+    )
+    return arrived, transitions
+
+
+def replay_damped_single_packet(
+    node_ids, links, source, destination, link_state,
+    at_thousandths, effective_event_cursor, packet_id, ttl,
+):
+    """Trace one damped replay packet over the current link states.
+
+    link_state holds the effective up state of every link after the
+    transitions already applied. Immediate delivery, no_route and
+    ttl_exhausted are attributed exactly as in event_trace_packet;
+    every hop is tagged with decision "damped_replay_route". Returns
+    the per-packet result object with keys at_ms,
+    effective_event_cursor, status, packet_id, path, hops,
+    final_node, ttl_remaining, reason.
+    """
+    source_id = node_ids[source]
+    destination_id = node_ids[destination]
+    result = {
+        "at_ms": format_ms(at_thousandths),
+        "effective_event_cursor": effective_event_cursor,
+        "status": None,
+        "packet_id": packet_id,
+        "path": [source_id],
+        "hops": [],
+        "final_node": source_id,
+        "ttl_remaining": ttl,
+        "reason": None,
+    }
+
+    if source == destination:
+        result["status"] = "delivered"
+        return result
+
+    effective_links = [
+        (link_id, u, v, cost, link_state[link_id])
+        for link_id, u, v, cost, _up in links
+    ]
+    route = find_route(node_ids, effective_links, source, destination)
+    if route is None:
+        result["status"] = "dropped"
+        result["reason"] = "no_route"
+        return result
+
+    path, route_links, _total_cost = route
+    remaining = ttl
+    for next_id, link_id in zip(path[1:], route_links):
+        if remaining <= 0:
+            result["status"] = "dropped"
+            result["reason"] = "ttl_exhausted"
+            result["ttl_remaining"] = remaining
+            return result
+        hop = {
+            "from": result["final_node"],
+            "to": next_id,
+            "link": link_id,
+            "ttl_before": remaining,
+            "ttl_after": remaining - 1,
+            "decision": "damped_replay_route",
+        }
+        result["hops"].append(hop)
+        remaining -= 1
+        result["path"].append(next_id)
+        result["final_node"] = next_id
+
+    result["status"] = "delivered"
+    result["ttl_remaining"] = remaining
+    return result
+
+
+def replay_damped_trace_packets(
+    node_ids, links, source, destination, hold_thousandths, events, packets
+):
+    """Replay damped link events and many packets on one time line.
+
+    Every link starts in its declared up state. Events and packet
+    entries are non-decreasing in time; before each packet, every
+    event arrival not later than the packet time is observed and
+    every transition whose effective time (at_ms + hold_thousandths,
+    see replay_damped_transitions) is not later than the packet time
+    is applied, so a packet is affected only by the damped events
+    that took effect at or before its own time. Each packet is traced
+    independently over the effective topology by
+    replay_damped_single_packet; the number of transitions applied
+    before the packet is reported as effective_event_cursor. With a
+    zero hold period every arrived event takes effect immediately and
+    the replay matches replay-trace.
+
+    Returns the output object with keys status, source, destination,
+    hold_down_ms, events, effective_events, results. status is
+    "damped_replayed"; events are echoed in full input order and
+    effective_events lists the events that took effect not later
+    than the last packet's time (empty when packets is empty), both
+    with times rendered to three fractional digits; results
+    correspond to the packets one to one.
+    """
+    rendered_events = [
+        {
+            "at_ms": format_ms(at),
+            "link": link_id,
+            "up": up,
+        }
+        for at, link_id, up in events
+    ]
+
+    rendered_effective = []
+    results = []
+    if packets:
+        clock_thousandths = packets[-1][0]
+        _arrived, transitions = replay_damped_transitions(
+            events, hold_thousandths, clock_thousandths
+        )
+        rendered_effective = [
+            {
+                "at_ms": format_ms(effective_at - hold_thousandths),
+                "effective_at_ms": format_ms(effective_at),
+                "link": link_id,
+                "up": up,
+            }
+            for effective_at, _index, link_id, up in transitions
+        ]
+
+        link_state = {link_id: up for link_id, _u, _v, _cost, up in links}
+        transition_cursor = 0
+        transition_count = len(transitions)
+        for at, packet_id, ttl, _priority, _payload in packets:
+            while (
+                transition_cursor < transition_count
+                and transitions[transition_cursor][0] <= at
+            ):
+                _eff, _index, link_id, up = transitions[transition_cursor]
+                link_state[link_id] = up
+                transition_cursor += 1
+            results.append(
+                replay_damped_single_packet(
+                    node_ids,
+                    links,
+                    source,
+                    destination,
+                    link_state,
+                    at,
+                    transition_cursor,
+                    packet_id,
+                    ttl,
+                )
+            )
+
+    return {
+        "status": "damped_replayed",
+        "source": node_ids[source],
+        "destination": node_ids[destination],
+        "hold_down_ms": format_ms(hold_thousandths),
+        "events": rendered_events,
+        "effective_events": rendered_effective,
+        "results": results,
+    }
+
+
 def ecmp_candidate_table(node_ids, links, destination):
     """Minimum-cost candidate next hops for every node, keyed by distance.
 
@@ -5325,6 +5623,26 @@ def build_parser():
         metavar="PATH",
         help="path to the UTF-8 JSON replay trace document",
     )
+    replay_damped_parser = subparsers.add_parser(
+        "replay-damped-trace",
+        help="replay damped link events and many packets on one time line",
+        description=(
+            "Replay link failure and recovery events with a "
+            "stabilization hold-down period and many packets on one "
+            "time line, suppressing events overturned during the "
+            "wait, applying every effective transition at each time "
+            "before the packets at that time and tracing each packet "
+            "over the effective topology."
+        ),
+        epilog=REPLAY_DAMPED_TRACE_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    replay_damped_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON replay trace document",
+    )
     return parser
 
 
@@ -5724,6 +6042,28 @@ def main(argv):
             packets = validate_replay_flow_packets(document)
             output = replay_flow_summary(
                 node_ids, links, source, destination, events, packets
+            )
+            write_json_line(sys.stdout, output)
+            return 0
+        if args.command == "replay-damped-trace":
+            node_ids, links, source, destination = validate(
+                document, REPLAY_DAMPED_TRACE_ROOT_FIELDS
+            )
+            hold_thousandths = parse_time_value(
+                document["hold_down_ms"],
+                MAX_LINK_LATENCY_THOUSANDTHS,
+                "hold_down_ms",
+            )
+            events = validate_events(document, [link[0] for link in links])
+            packets = validate_replay_packets(document)
+            output = replay_damped_trace_packets(
+                node_ids,
+                links,
+                source,
+                destination,
+                hold_thousandths,
+                events,
+                packets,
             )
             write_json_line(sys.stdout, output)
             return 0

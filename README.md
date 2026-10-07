@@ -198,6 +198,14 @@ TTL 衰减、到达时 ttl 为零仍送达、起终点相同时立即送达、`n
 
 成功时标准输出一行紧凑 JSON，顶层键依次为 `status`、`source`、`destination`、`events`、`packet_count`、`delivered_count`、`dropped_count`、`drop_reasons`、`flows`。`status` 固定为 `flow_summarized`；`events` 沿用 `replay-trace` 的回显与时间格式；`delivered_count` 与 `dropped_count` 之和等于 `packet_count`；`drop_reasons` 固定依次包含 `node_down`、`no_route`、`ttl_exhausted`，三项整数之和等于 `dropped_count`。`flows` 按 `flow_id` 的 Unicode 码点序排列，每个出现的流恰好一项，每项键依次为 `flow_id`、`packet_count`、`delivered_count`、`dropped_count`、`drop_reasons`、`traversals`，内层 `drop_reasons` 同样固定按 `node_down`、`no_route`、`ttl_exhausted` 排列；各流的报文数、送达数、丢弃数、三种原因数和 traversals 之和分别与总体计数相符。相同输入逐字节一致，不读墙上时钟，不写文件；设事件数、报文数、节点数、链路数、已完成跳数和流数为 E、Q、N、M、H、F，时间上界为 O(E+Q(N+M)log(N+M)+H+FlogF)，除输出外额外内存为 O(E+N+M+Q+H+F)。既有命令的公开行为保持不变。
 
+### `replay-damped-trace --input PATH`
+
+在根对象中包含 `nodes`、`links`、`source`、`destination`、`hold_down_ms`、`events`、`packets` 七个字段（拒绝其他字段）。拓扑与 `hold_down_ms` 沿用 `damped-event-trace`：`hold_down_ms` 是 0 至 86400000.000 的十进制毫秒字符串，最多三位小数，为每条链路事件生效前必须挺过的稳定等待期。`events` 沿用 `event-trace` 的链路事件约束：最多 100000 项，每项只含 `at_ms`、`link`（必须引用已声明链路）、`up`（JSON 布尔值），按 `at_ms` 非递减排列。`packets` 沿用 `replay-trace` 的约束且不接受 `flow_id`：最多 10000 项，每项只含 `at_ms` 与四字段 `packet`（`id`、`ttl`、`priority`、`payload`），按 `at_ms` 非递减排列，空数组合法。根字段、拓扑、`hold_down_ms`、事件以及 `packets` 包装结构非法均输出 `ConfigError`（退出码 3）；端点非法为 `ParameterError`（退出码 2）；嵌套 `packet` 非法为 `PacketError`（退出码 4）。出错时标准输出为空且无部分结果，拓扑、端点、稳定等待期、全部事件和全部报文完整校验后才开始回放。
+
+各链路从声明的 `up` 状态开始；事件在 `at_ms` 加 `hold_down_ms` 时生效。同一链路的新事件若早于前一待定事件的生效时刻到达，就取消前一待定事件并重新等待自己的稳定期，即使 `up` 相同也重新等待；若恰在前一事件待生效时刻到达，则前一事件先生效，同一时刻的事件按输入顺序处理。处理每个报文前先应用不晚于其 `at_ms` 的事件到达与生效转换，更晚的事件与转换不影响它。`hold_down_ms` 为零时全部到达事件立即按原顺序生效，结果与 `replay-trace` 对等。随后每个报文在当时的有效拓扑上独立沿用 `trace` 的最小代价选路、平局处理、TTL 衰减、立即送达及 `no_route`、`ttl_exhausted` 归因；应用事件不消耗 ttl，单个报文最多经过节点数减一跳，不读墙上时钟、不写文件。
+
+成功时标准输出一行紧凑 JSON，顶层键依次为 `status`、`source`、`destination`、`hold_down_ms`、`events`、`effective_events`、`results`，其中 `status` 固定为 `damped_replayed`，`hold_down_ms` 补足三位小数。`events` 完整回显全部输入事件并保持输入顺序，每项键依次为 `at_ms`、`link`、`up`，时间补足三位小数。`effective_events` 只列生效时刻不晚于末个报文 `at_ms` 的事件并按生效顺序排列，每项键依次为 `at_ms`、`effective_at_ms`、`link`、`up`；空 `packets` 时为空。`results` 与 `packets` 一一对应，每项依次包含 `at_ms`、`effective_event_cursor`、`status`、`packet_id`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`：`effective_event_cursor` 为处理该报文前已生效的事件数（即生效时刻不晚于该报文时间的转换数）；`status` 为 `delivered`（`reason` 为 null）或 `dropped`（`reason` 为唯一丢弃原因）。每个 hop 的键序为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `damped_replay_route`）。相同输入逐字节一致；设事件数、报文数、节点数、链路数和全部报文实际跳数总和为 E、Q、N、M、H，时间上界为 O(ElogE+Q(N+M)log(N+M)+H)，额外内存为 O(E+N+M+Q+H)。既有命令的公开行为保持不变。
+
 ## 状态
 
 仓库初始为空，功能按增量需求持续构建。
