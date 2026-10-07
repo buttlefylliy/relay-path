@@ -142,6 +142,14 @@ TTL 衰减、到达时 ttl 为零仍送达、起终点相同时立即送达、`n
 
 成功或业务丢弃时输出一行紧凑 JSON，顶层字段及顺序与 `trace` 相同（`status`、`packet_id`、`source`、`destination`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`）；每个实际跳的字段依次为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `fragment_forward`）、`mtu_bytes`、`payload_bytes`、`fragment_count`、`last_fragment_bytes`，其中前 `fragment_count` 减一片的长度均等于 `mtu_bytes`，最后一片长度由 `last_fragment_bytes` 给出。相同输入逐字节一致，不读墙上时钟；设实际跳数为 H、载荷字节数为 P，时间上界为 O((N+M)log(N+M)+P+H)，额外内存为 O(N+M+P+H)，不按分片数展开输出。既有十二个命令的输入、输出、错误分类、退出码和帮助行为保持不变。
 
+### `replay-trace --input PATH`
+
+根对象恰好包含 `nodes`、`links`、`source`、`destination`、`events`、`packets` 六个字段（拒绝其他字段）。拓扑与端点约束沿用 `route`；`events` 沿用 `topology-event-trace` 的全部规则（最多 100000 项，每项含 `at_ms`、`target_type`、`target`、`up`，按 `at_ms` 非递减排列）；`packets` 是最多 10000 项的数组，每项只含 `at_ms`（与 `clock_ms` 同规则同范围的毫秒字符串）和 `packet`（与 `trace` 完全相同的四字段报文），按 `at_ms` 非递减排列，同一时刻保持数组顺序。根字段、拓扑、事件、`packets` 结构或报文时间非法输出 `ConfigError`（退出码 3）；端点非法为 `ParameterError`（2）；嵌套 `packet` 非法为 `PacketError`（4）；出错时标准输出为空且无部分结果，全部输入校验完成后才开始回放。
+
+各节点初始可用，各链路从声明的 `up` 状态开始。按数组顺序处理报文：转发每个报文前，先把全部 `at_ms` 不晚于该报文 `at_ms` 的事件按输入顺序应用（同一时刻的事件全部先于该时刻的报文生效），更晚的事件永不影响该报文。随后每个报文在与 `topology-event-trace` 完全相同的有效拓扑语义下转发：节点事件只设可用性、链路事件只覆盖链路自身状态，链路参与选路当且仅当自身状态为 up 且两端节点可用；source 或 destination 不可用时在 source 以 `node_down` 丢弃且优先于起终点相同判定；选路、平局、TTL 衰减、`no_route`、`ttl_exhausted` 与立即送达均沿用 `trace`。应用事件不消耗 ttl，不读墙上时钟，不写文件；每报文跳数上限为节点数减一。空 `packets` 产生空 `results`。
+
+成功时输出一行紧凑 JSON，顶层键依次为 `status`、`source`、`destination`、`events`、`results`，`status` 固定为 `replayed`。`events` 完整按输入顺序列出全部事件，每项键依次为 `at_ms`、`target_type`、`target`、`up`，时间统一三位小数。`results` 与 `packets` 一一对应，每项键依次为 `at_ms`（三位小数）、`event_cursor`（转发该报文前已应用的事件数）、`status`、`packet_id`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`；每个 hop 的键序为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `replay_event_route`）。相同输入逐字节一致；设事件、报文、节点、链路和总跳数为 E、Q、N、M、H，时间上界为 O(E+Q(N+M)log(N+M)+H)，额外内存为 O(E+N+M+Q+H)。既有十三个命令的输入、输出、错误分类、退出码和帮助行为保持不变。
+
 ## 状态
 
 仓库初始为空，功能按增量需求持续构建。
