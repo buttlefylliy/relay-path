@@ -166,6 +166,16 @@ TTL 衰减、到达时 ttl 为零仍送达、起终点相同时立即送达、`n
 
 成功时标准输出一行紧凑 JSON，顶层键依次为 `status`、`source`、`destination`、`events`、`results`，其中 `status` 固定为 `replayed`。`events` 完整回显全部输入事件并保持输入顺序（不剔除晚于最后一个报文的事件），每项键依次为 `at_ms`、`target_type`、`target`、`up`，时间统一补足三位小数。`results` 与 `packets` 一一对应，每项依次包含 `at_ms`、`event_cursor`、`status`、`packet_id`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`：`event_cursor` 为处理该报文前已应用的事件数（即 `at_ms` 不晚于该报文时间的事件数）；`status` 为 `delivered`（`reason` 为 null）或 `dropped`（`reason` 为唯一丢弃原因）。每个 hop 的键序为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `replay_event_route`）。空 `packets` 返回空 `results`。设事件数、报文数、节点数、链路数和全部报文实际跳数总和为 E、Q、N、M、H，时间上界为 O(E+Q(N+M)log(N+M)+H)，额外内存为 O(E+N+M+Q+H)。相同输入逐字节一致，既有命令的公开行为保持不变。
 
+### `explain-replay-trace --input PATH`
+
+输入与 `replay-trace` 完全相同（`nodes`、`links`、`source`、`destination`、`events`、`packets` 六个字段，拒绝其他字段），沿用其全部输入、限制与同刻事件先于报文生效的规则；错误分类与标准流行为不变：根字段、拓扑、事件与 `packets` 包装结构非法输出 `ConfigError`（退出码 3），未声明端点输出 `ParameterError`（退出码 2），嵌套 `packet` 非法输出 `PacketError`（退出码 4），出错时标准输出为空且无部分结果；拓扑、端点、全部事件和全部报文完整校验后才开始回放，空 `packets` 合法。
+
+回放、TTL、丢弃归因与事件覆盖语义与 `replay-trace` 完全一致：各节点初始可用、各链路从声明的 `up` 状态开始，同一时刻先按数组顺序应用全部事件再处理报文，每个报文只受不晚于自身时间的事件影响并在当时有效拓扑上独立执行。输出顶层键序（`status`、`source`、`destination`、`events`、`results`）、`status`（固定 `replayed`）与 `events` 回显与 `replay-trace` 相同，`results` 与 `packets` 一一对应；每个 result 的前九项（`at_ms`、`event_cursor`、`status`、`packet_id`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`）及取值与同一输入的 `replay-trace` 逐项一致，并在 `reason` 后增加 `decisions`。
+
+`decisions` 按该报文实际执行选路的节点顺序排列，每项沿用 `explain-route` 的 `node`、`chosen_link`、`chosen_to`、`remaining_cost`、`candidates` 语义与键序；候选收录当前节点的全部出链（含不可用链路），按（目标节点 id、链路 id）的 Unicode 码点序排列，每项键序为 `link`、`to`、`link_cost`、`suffix_cost`、`total_cost`、`outcome`，代价语义与 `explain-route` 相同。分类基于该报文时刻的有效拓扑（链路自身 `up` 且两端节点均可用才参与选路）：`outcome` 只取 `selected`、`link_down`、`target_node_down`、`no_suffix_route`、`higher_cost`、`tie_break_lost`；链路自身关闭优先归为 `link_down`，链路开启但其目标节点不可用归为 `target_node_down`，这两类候选的 `suffix_cost` 与 `total_cost` 均为 null；其余沿用 `explain-route` 的 `no_suffix_route`、`higher_cost`、`selected`、`tie_break_lost` 规则。每个成功 hop 恰好对应一项含 `selected` 候选的决策，所选链路和下一节点与 hop 一致。
+
+`node_down` 丢弃与起终点相同的立即送达不执行选路，`decisions` 为空；`no_route` 时 `decisions` 只保留 source 的一项无选择决策，`chosen_link`、`chosen_to`、`remaining_cost` 均为 null，候选照常分类且没有 `selected`；转发前 ttl 为零时不为当前节点追加决策，`decisions` 只保留此前成功 hop 的决策，到达终点时 ttl 恰为零仍正常送达且各跳决策齐全。选路、TTL、丢弃归因与事件覆盖语义不随解释改变，相同输入逐字节一致且不读墙上时钟；设事件数、报文数、节点数、链路数和输出候选总数为 E、Q、N、M、D，时间上界为 O(E+Q(N+M)log(N+M)+D)，除输出外额外内存为 O(E+N+M)。其他命令的公开行为保持不变。
+
 ### `replay-hop-summary --input PATH`
 
 输入与 `replay-trace` 完全相同（`nodes`、`links`、`source`、`destination`、`events`、`packets` 六个字段，拒绝其他字段），全部拓扑、端点、事件与报文约束及错误分类不变：根字段、拓扑、事件与 `packets` 包装结构非法输出 `ConfigError`（退出码 3），未声明端点输出 `ParameterError`（退出码 2），嵌套 `packet` 非法输出 `PacketError`（退出码 4），出错时标准输出为空且无部分结果；拓扑、端点、全部事件和全部报文完整校验后才生成汇总。

@@ -22,6 +22,7 @@ Public entry points:
     python relay_path.py topology-event-trace --input PATH
     python relay_path.py fragment-trace --input PATH
     python relay_path.py replay-trace --input PATH
+    python relay_path.py explain-replay-trace --input PATH
     python relay_path.py replay-hop-summary --input PATH
     python relay_path.py replay-path-summary --input PATH
     python relay_path.py replay-node-summary --input PATH
@@ -77,7 +78,10 @@ link departure and reassembles at the next node (fragment-trace), or
 a replay that walks one time line applying every topology event at
 each time before the packets at that time and traces many packets in
 array order over the effective topology (replay-trace), or a replay
-that summarizes the same time line per link, counting how many times
+that traces the same time line and explains the minimum-cost routing
+decision at every node where each packet actually executes routing
+(explain-replay-trace), or a replay that summarizes the same time line
+per link, counting how many times
 each declared link was traversed across all packets
 (replay-hop-summary), or a replay that summarizes the same time line
 per full path, grouping packets by the events applied before them,
@@ -1172,6 +1176,67 @@ errors (single compact JSON line on stderr, keys: error, message):
   packet-entry structure, times or ordering, ParameterError
   (exit code 2) for an undeclared source or destination, and
   PacketError (exit code 4) for an invalid nested packet; stdout is
+  left empty with no partial results. All validation completes
+  before the replay begins.
+"""
+
+REPLAY_EXPLAIN_HELP = """\
+input format (UTF-8 JSON object with exactly these six fields):
+  nodes, links, source, destination, events, packets
+              exactly as in the replay-trace command; every topology,
+              endpoint, event and packet-entry constraint, field
+              check order and error classification applies
+              unchanged, and an empty packets array is allowed.
+
+replay rules:
+  the time line is replayed exactly as in replay-trace: every node
+  starts available and every link starts in its declared up state,
+  at any one time every event at that time is applied first and the
+  packets at that time are then processed in array order, and each
+  packet is traced independently over the effective topology with
+  the topology-event-trace semantics (node_down checked before
+  source equal to destination, immediate delivery, no_route, ttl
+  decay and ttl_exhausted). The first nine keys of every result and
+  every forwarding result are exactly what replay-trace produces
+  for the same input. decisions adds the minimum-cost routing
+  explanation for the nodes at which routing was actually executed
+  in that packet order; each entry uses the same node, chosen_link,
+  chosen_to, remaining_cost, candidates keys and candidate
+  semantics as explain-route, with candidates ordered by (next
+  node id, link id) in Unicode code point order and classified with
+  the outcomes selected, link_down, target_node_down,
+  no_suffix_route, higher_cost and tie_break_lost. Classification
+  uses the topology effective at the packet's own time, where a
+  link participates exactly when its own up state is true and both
+  endpoint nodes are available. A down link is link_down (its
+  suffix_cost and total_cost are null); a link whose own state is
+  up but whose target node is unavailable is target_node_down (its
+  suffix_cost and total_cost are null, and it is never selected);
+  otherwise the same five-way explain-route rules apply. Every
+  successful hop corresponds to exactly one decision containing a
+  selected candidate, and its chosen link and next node match the
+  hop. A node_down drop and an immediate delivery (source equal to
+  destination) run no routing, so decisions is empty. When no
+  route exists decisions holds only the source entry, with
+  chosen_link, chosen_to and remaining_cost all null, its
+  candidates classified as above with none selected. A ttl of zero
+  before forwarding runs no routing at the current node, so
+  decisions keeps only the decisions for the earlier successful
+  hops; arriving at the destination with ttl reduced to zero is
+  still delivered and every hop's decision is present.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, source, destination, events, results
+  exactly as in replay-trace, and results corresponds to packets
+  one to one; each entry has keys at_ms, event_cursor, status,
+  packet_id, path, hops, final_node, ttl_remaining, reason,
+  decisions in this order, the first nine exactly the
+  replay-trace result for the same packet. An empty packets array
+  yields an empty results.
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3), ParameterError (exit code 2) and
+  PacketError (exit code 4) exactly as in replay-trace; stdout is
   left empty with no partial results. All validation completes
   before the replay begins.
 """
@@ -4019,6 +4084,135 @@ def replay_single_packet(
     return result
 
 
+def explain_replay_single_packet(
+    node_ids, links, source, destination, available, link_state,
+    at_thousandths, event_cursor, packet_id, ttl,
+):
+    """Trace one replay packet exactly as replay_single_packet and add a
+    decisions explanation of every routing decision it executes.
+
+    The first nine result keys (at_ms, event_cursor, status, packet_id,
+    path, hops, final_node, ttl_remaining, reason) are exactly the
+    replay_single_packet result for the same effective topology, ttl
+    rule and drop attribution. A reverse Dijkstra from the destination
+    over the effective topology (shared with ecmp_candidate_table)
+    supplies each node's remaining cost; every decision entry and
+    candidate uses the explain-route fields and ordering, with
+    candidates classified against the topology effective at the
+    packet's own time: a down link is link_down, an up link whose
+    target node is unavailable is target_node_down (both kinds null on
+    suffix_cost and total_cost), and otherwise the explain-route
+    no_suffix_route, higher_cost, selected and tie_break_lost rules
+    apply.
+
+    A decision is recorded only at a node where routing is actually
+    executed: one per successful hop, in execution order, plus the
+    single source entry with no selected candidate when no route
+    exists. A node_down drop and an immediate delivery route nowhere
+    and yield no decisions; a ttl of zero before forwarding runs no
+    routing at the current node, so only the earlier hops' decisions
+    remain. Returns the result object with those nine keys plus
+    decisions.
+    """
+    result = replay_single_packet(
+        node_ids,
+        links,
+        source,
+        destination,
+        available,
+        link_state,
+        at_thousandths,
+        event_cursor,
+        packet_id,
+        ttl,
+    )
+    decisions = []
+    result["decisions"] = decisions
+
+    # node_down and immediate delivery never execute routing.
+    if result["reason"] == "node_down" or source == destination:
+        return result
+
+    node_count = len(node_ids)
+
+    effective_links = [
+        (
+            link_id,
+            u,
+            v,
+            cost,
+            link_state[link_id] and available[u] and available[v],
+        )
+        for link_id, u, v, cost, _up in links
+    ]
+
+    outgoing = [[] for _ in range(node_count)]
+    for link_id, u, v, cost, _effective_up in effective_links:
+        outgoing[u].append((link_id, v, cost))
+
+    dist, _equal_cost = ecmp_candidate_table(
+        node_ids, effective_links, destination
+    )
+
+    def build_decision(node):
+        remaining = dist[node]
+        candidates = []
+        chosen_link = None
+        chosen_to = None
+        ordered = sorted(
+            outgoing[node], key=lambda item: (node_ids[item[1]], item[0])
+        )
+        for link_id, nxt, cost in ordered:
+            # Effective participation: the link's own state is up and
+            # both endpoint nodes are available.
+            link_up = link_state[link_id]
+            if not link_up:
+                outcome = "link_down"
+                suffix = None
+            elif not available[nxt]:
+                outcome = "target_node_down"
+                suffix = None
+            else:
+                suffix = dist[nxt]
+                if suffix is None:
+                    outcome = "no_suffix_route"
+                elif cost + suffix > remaining:
+                    outcome = "higher_cost"
+                elif chosen_link is None:
+                    outcome = "selected"
+                    chosen_link = link_id
+                    chosen_to = node_ids[nxt]
+                else:
+                    outcome = "tie_break_lost"
+            total = cost + suffix if suffix is not None else None
+            candidates.append(
+                {
+                    "link": link_id,
+                    "to": node_ids[nxt],
+                    "link_cost": cost,
+                    "suffix_cost": suffix,
+                    "total_cost": total,
+                    "outcome": outcome,
+                }
+            )
+        return {
+            "node": node_ids[node],
+            "chosen_link": chosen_link,
+            "chosen_to": chosen_to,
+            "remaining_cost": remaining,
+            "candidates": candidates,
+        }
+
+    if result["reason"] == "no_route":
+        decisions.append(build_decision(source))
+        return result
+
+    index_of = {node_id: index for index, node_id in enumerate(node_ids)}
+    for hop in result["hops"]:
+        decisions.append(build_decision(index_of[hop["from"]]))
+    return result
+
+
 def replay_trace_packets(
     node_ids, links, source, destination, events, packets
 ):
@@ -4066,6 +4260,76 @@ def replay_trace_packets(
             event_cursor += 1
         results.append(
             replay_single_packet(
+                node_ids,
+                links,
+                source,
+                destination,
+                available,
+                link_state,
+                at,
+                event_cursor,
+                packet_id,
+                ttl,
+            )
+        )
+
+    return {
+        "status": "replayed",
+        "source": node_ids[source],
+        "destination": node_ids[destination],
+        "events": rendered_events,
+        "results": results,
+    }
+
+
+def explain_replay_trace_packets(
+    node_ids, links, source, destination, events, packets
+):
+    """Replay topology events and many packets on one time line exactly
+    as replay_trace_packets, explaining every executed routing decision.
+
+    The time line walk and event-override semantics are identical:
+    every node starts available and every link starts in its declared
+    up state; before each packet every event with at_ms less than or
+    equal to the packet time is applied in input order, so all events
+    at a time run before the packets at that time. Each packet is
+    traced independently by explain_replay_single_packet, so every
+    result keeps the nine replay-trace keys and gains decisions; the
+    applied event count before the packet is still reported as
+    event_cursor.
+
+    Returns the output object with keys status, source, destination,
+    events, results. status is "replayed"; events are echoed in full
+    input order with at_ms rendered to three fractional digits, and
+    results correspond to the packets one to one.
+    """
+    available = [True] * len(node_ids)
+    node_index = {node_id: index for index, node_id in enumerate(node_ids)}
+    link_state = {link_id: up for link_id, _u, _v, _cost, up in links}
+
+    rendered_events = [
+        {
+            "at_ms": format_ms(at),
+            "target_type": target_type,
+            "target": target,
+            "up": up,
+        }
+        for at, target_type, target, up in events
+    ]
+
+    results = []
+    event_cursor = 0
+    event_count = len(events)
+    for at, packet_id, ttl, _priority, _payload in packets:
+        while event_cursor < event_count and events[event_cursor][0] <= at:
+            _at, target_type, target, up = events[event_cursor]
+            if target_type == TOPOLOGY_TARGET_NODE:
+                available[node_index[target]] = up
+            else:
+                link_state[target] = up
+            event_cursor += 1
+        results.append(
+            explain_replay_single_packet(
                 node_ids,
                 links,
                 source,
@@ -5679,6 +5943,28 @@ def build_parser():
         metavar="PATH",
         help="path to the UTF-8 JSON replay trace document",
     )
+    replay_explain_parser = subparsers.add_parser(
+        "explain-replay-trace",
+        help=(
+            "replay topology events and many packets, explaining each"
+            " executed routing decision"
+        ),
+        description=(
+            "Replay mixed node and link failure and recovery events "
+            "and many packets on one time line exactly as in "
+            "replay-trace, and explain the minimum-cost routing "
+            "decision at every node where each packet actually "
+            "executes routing."
+        ),
+        epilog=REPLAY_EXPLAIN_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    replay_explain_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON replay trace document",
+    )
     replay_hop_summary_parser = subparsers.add_parser(
         "replay-hop-summary",
         help="replay the time line and summarize traversals per link",
@@ -6135,6 +6421,19 @@ def main(argv):
             )
             packets = validate_replay_packets(document)
             output = replay_trace_packets(
+                node_ids, links, source, destination, events, packets
+            )
+            write_json_line(sys.stdout, output)
+            return 0
+        if args.command == "explain-replay-trace":
+            node_ids, links, source, destination = validate(
+                document, REPLAY_TRACE_ROOT_FIELDS
+            )
+            events = validate_topology_events(
+                document, node_ids, [link[0] for link in links]
+            )
+            packets = validate_replay_packets(document)
+            output = explain_replay_trace_packets(
                 node_ids, links, source, destination, events, packets
             )
             write_json_line(sys.stdout, output)
