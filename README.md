@@ -158,6 +158,14 @@ TTL 衰减、到达时 ttl 为零仍送达、起终点相同时立即送达、`n
 
 成功时标准输出一行紧凑 JSON，顶层键依次为 `status`、`source`、`destination`、`events`、`results`，其中 `status` 固定为 `replayed`。`events` 完整回显全部输入事件并保持输入顺序（不剔除晚于最后一个报文的事件），每项键依次为 `at_ms`、`target_type`、`target`、`up`，时间统一补足三位小数。`results` 与 `packets` 一一对应，每项依次包含 `at_ms`、`event_cursor`、`status`、`packet_id`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`：`event_cursor` 为处理该报文前已应用的事件数（即 `at_ms` 不晚于该报文时间的事件数）；`status` 为 `delivered`（`reason` 为 null）或 `dropped`（`reason` 为唯一丢弃原因）。每个 hop 的键序为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `replay_event_route`）。空 `packets` 返回空 `results`。设事件数、报文数、节点数、链路数和全部报文实际跳数总和为 E、Q、N、M、H，时间上界为 O(E+Q(N+M)log(N+M)+H)，额外内存为 O(E+N+M+Q+H)。相同输入逐字节一致，既有命令的公开行为保持不变。
 
+### `replay-hop-summary --input PATH`
+
+输入与 `replay-trace` 完全相同（`nodes`、`links`、`source`、`destination`、`events`、`packets` 六个字段，拒绝其他字段），全部拓扑、端点、事件与报文约束及错误分类不变：根字段、拓扑、事件与 `packets` 包装结构非法输出 `ConfigError`（退出码 3），未声明端点输出 `ParameterError`（退出码 2），嵌套 `packet` 非法输出 `PacketError`（退出码 4），出错时标准输出为空且无部分结果；拓扑、端点、全部事件和全部报文完整校验后才生成汇总。
+
+回放规则与 `replay-trace` 完全一致：各节点初始可用，各链路从声明的 `up` 状态开始，同一时刻先按数组顺序应用全部事件再按数组顺序处理该时刻的报文，每个报文只受不晚于自身时间的事件影响，并在当时有效拓扑上独立执行最小代价选路、状态覆盖、TTL 衰减与 `node_down`、`no_route`、`ttl_exhausted` 归因。不同之处在于不输出逐跳记录：每成功通过一条链路就为该链路累计一次 traversal；未产生的跳不计数，中途 TTL 耗尽的报文只计此前完成的跳。晚到事件仍完整回显，空 `packets` 合法。
+
+成功时标准输出一行紧凑 JSON，顶层键依次为 `status`、`source`、`destination`、`events`、`packet_count`、`delivered_count`、`dropped_count`、`drop_reasons`、`links`。`status` 固定为 `summarized`；`events` 保持输入顺序完整回显，每项键依次为 `at_ms`、`target_type`、`target`、`up`，时间补足三位小数；`delivered_count` 与 `dropped_count` 之和等于 `packet_count`；`drop_reasons` 固定依次包含 `node_down`、`no_route`、`ttl_exhausted`，三项整数之和等于 `dropped_count`；`links` 包含每条已声明链路且只出现一次，按链路 id 的 Unicode 码点序排列，每项键依次为 `link`、`from`、`to`、`traversals`，端点保持声明值，`traversals` 为全部报文经过该链路的次数。空 `packets` 产生全零总数、原因和链路计数。相同输入逐字节一致，不读墙上时钟，不写文件；设事件数、报文数、节点数、链路数和成功跳数为 E、Q、N、M、H，时间上界为 O(E+Q(N+M)log(N+M)+H+MlogM)，除输出外额外内存为 O(E+N+M+Q+H)。既有命令的公开行为保持不变。
+
 ## 状态
 
 仓库初始为空，功能按增量需求持续构建。
