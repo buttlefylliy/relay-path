@@ -142,6 +142,14 @@ TTL 衰减、到达时 ttl 为零仍送达、起终点相同时立即送达、`n
 
 成功或业务丢弃时输出一行紧凑 JSON，顶层字段及顺序与 `trace` 相同（`status`、`packet_id`、`source`、`destination`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`）；每个实际跳的字段依次为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `fragment_forward`）、`mtu_bytes`、`payload_bytes`、`fragment_count`、`last_fragment_bytes`，其中前 `fragment_count` 减一片的长度均等于 `mtu_bytes`，最后一片长度由 `last_fragment_bytes` 给出。相同输入逐字节一致，不读墙上时钟；设实际跳数为 H、载荷字节数为 P，时间上界为 O((N+M)log(N+M)+P+H)，额外内存为 O(N+M+P+H)，不按分片数展开输出。既有十二个命令的输入、输出、错误分类、退出码和帮助行为保持不变。
 
+### `replay-trace --input PATH`
+
+在根对象中包含 `nodes`、`links`、`source`、`destination`、`events`、`packets` 六个字段（拒绝其他字段）。拓扑、端点和 `events` 完全沿用 `topology-event-trace`：`events` 为最多 100000 项的混合节点/链路事件数组，按 `at_ms` 非递减排列。`packets` 是最多 10000 项的数组，每项只含 `at_ms`（与事件时间同规则同范围的毫秒字符串）和 `packet`（沿用 `trace` 的四字段 `id`、`ttl`、`priority`、`payload` 结构与全部约束）；`packets` 按 `at_ms` 非递减排列，空数组合法。根字段、拓扑、事件以及 `packets` 包装结构、条目结构、数量、报文时间格式或顺序非法均输出 `ConfigError`（退出码 3）；端点非法仍为 `ParameterError`（退出码 2）；嵌套 `packet` 自身的任何结构或取值非法输出 `PacketError`（退出码 4）。出错时标准输出为空且无部分结果，拓扑、端点、全部事件和全部报文完整校验后才开始回放。
+
+各节点初始均可用，各链路从声明的初始 `up` 状态开始。沿时间线按数组顺序推进：同一时刻先应用该时刻的全部拓扑事件（事件间按数组顺序），再按数组顺序处理该时刻的报文；每个报文只受 `at_ms` 小于或等于自身时间的事件影响，更晚的事件不生效。节点事件只设置节点可用性，链路事件只覆盖链路自身状态：节点不可用时其全部入链和出链均不参与选路，但不改写链路状态；节点恢复后，链路仍服从最后一次链路事件（无则为声明的初始 `up`）。随后每个报文在当时的有效拓扑上独立沿用 `topology-event-trace` 的全部语义：source 或 destination 不可用时在 source 以 `node_down` 丢弃（优先于 source 等于 destination），起终点相同立即送达且不消耗 ttl，无路可达在 source 以 `no_route` 丢弃，离开节点前 ttl 须大于零、每条链路后减一，到达 destination 时 ttl 恰为零仍算送达，转发前 ttl 为零在当前节点以 `ttl_exhausted` 丢弃。应用事件不消耗 ttl，单个报文最多经过节点数减一跳，不读墙上时钟、不写文件。
+
+成功时标准输出一行紧凑 JSON，顶层键依次为 `status`、`source`、`destination`、`events`、`results`，其中 `status` 固定为 `replayed`。`events` 完整回显全部输入事件并保持输入顺序（不剔除晚于最后一个报文的事件），每项键依次为 `at_ms`、`target_type`、`target`、`up`，时间统一补足三位小数。`results` 与 `packets` 一一对应，每项依次包含 `at_ms`、`event_cursor`、`status`、`packet_id`、`path`、`hops`、`final_node`、`ttl_remaining`、`reason`：`event_cursor` 为处理该报文前已应用的事件数（即 `at_ms` 不晚于该报文时间的事件数）；`status` 为 `delivered`（`reason` 为 null）或 `dropped`（`reason` 为唯一丢弃原因）。每个 hop 的键序为 `from`、`to`、`link`、`ttl_before`、`ttl_after`、`decision`（固定 `replay_event_route`）。空 `packets` 返回空 `results`。设事件数、报文数、节点数、链路数和全部报文实际跳数总和为 E、Q、N、M、H，时间上界为 O(E+Q(N+M)log(N+M)+H)，额外内存为 O(E+N+M+Q+H)。相同输入逐字节一致，既有命令的公开行为保持不变。
+
 ## 状态
 
 仓库初始为空，功能按增量需求持续构建。

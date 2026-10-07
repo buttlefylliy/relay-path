@@ -19,6 +19,7 @@ Public entry points:
     python relay_path.py node-event-trace --input PATH
     python relay_path.py topology-event-trace --input PATH
     python relay_path.py fragment-trace --input PATH
+    python relay_path.py replay-trace --input PATH
 
 Reads a UTF-8 JSON object describing relay nodes and directed links and
 prints the minimum-cost route from source to destination (route), the
@@ -60,7 +61,10 @@ link failure and recovery events in one timeline against an explicit
 event clock and forwards the packet over the effective topology at
 the query time (topology-event-trace), or a trace that slices the
 reassembled payload into MTU-sized fragments before every successful
-link departure and reassembles at the next node (fragment-trace), as
+link departure and reassembles at the next node (fragment-trace), or
+a replay that walks one time line applying every topology event at
+each time before the packets at that time and traces many packets in
+array order over the effective topology (replay-trace), as
 one compact JSON object on stdout.
 """
 
@@ -111,7 +115,10 @@ DAMPED_EVENT_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + (
 NODE_EVENT_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("clock_ms", "events")
 TOPOLOGY_EVENT_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("clock_ms", "events")
 FRAGMENT_TRACE_ROOT_FIELDS = TRACE_ROOT_FIELDS + ("mtus",)
+REPLAY_TRACE_ROOT_FIELDS = ROOT_FIELDS + ("events", "packets")
 PACKET_FIELDS = ("id", "ttl", "priority", "payload")
+REPLAY_PACKET_ENTRY_FIELDS = ("at_ms", "packet")
+MAX_REPLAY_PACKETS = 10000
 STICKY_PACKET_FIELDS = PACKET_FIELDS + ("flow_id",)
 TIME_PATTERN = re.compile(r"[0-9]+(\.[0-9]{1,3})?\Z")
 LOSS_RATE_PATTERN = re.compile(r"(0\.[0-9]{6}|1\.0{6})\Z")
@@ -980,6 +987,79 @@ errors (single compact JSON line on stderr, keys: error, message):
   any tracing begins.
 """
 
+REPLAY_HELP = """\
+input format (UTF-8 JSON object with exactly these six fields):
+  nodes, links, source, destination
+              exactly as in the topology-event-trace command; all
+              topology and endpoint constraints apply unchanged
+  events      array of at most 100000 mixed node/link events, exactly
+              as in the topology-event-trace command:
+                at_ms, target_type ("link" or "node"), target (the
+                declared id of that type), up (boolean)
+              events are ordered by non-decreasing at_ms; events at
+              the same time apply in array order, and repeated sets
+              of one target (including later recovery) are allowed.
+  packets     array of at most 10000 entries, each with exactly the
+              fields:
+                at_ms   decimal millisecond string under the same
+                        format and range rules as an event at_ms; the
+                        entries must be ordered by non-decreasing
+                        at_ms
+                packet  the four-field trace packet object (id,
+                        ttl, priority, payload) with every trace
+                        packet constraint unchanged
+              an empty array is allowed and yields an empty results.
+
+replay rules:
+  every node starts available and every link starts in its declared
+  up state. The time line is walked in array order. At any one time
+  every event at that time is applied first and the packets at that
+  time are then processed in array order; a packet is affected only
+  by events whose at_ms is less than or equal to its own at_ms, and
+  later events never affect it. Node events set node availability and
+  link events overwrite only the link's own up state, which starts
+  from the declared value; node downtime never rewrites a link's
+  state, so a link still obeys its latest link event after its
+  endpoint nodes recover. A link participates in routing exactly
+  when its own up state is true and both endpoint nodes are
+  available. Each packet is then traced independently over the
+  effective topology with the topology-event-trace semantics: if the
+  source or the destination is unavailable the packet is dropped at
+  the source with reason node_down (checked before source equal to
+  destination), a source equal to its destination is delivered
+  immediately, no_route drops at the source, ttl must be greater than
+  zero before leaving a node and decreases by one per link (arrival
+  at the destination with ttl reduced to zero still counts as
+  delivered), and ttl_exhausted drops at the current node. At most
+  (node count - 1) hops are possible per packet. Replaying never
+  reads the wall clock.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, source, destination, events, results
+  status is always "replayed". events echoes every input event in
+  input order, each with keys at_ms, target_type, target, up in this
+  order and at_ms rendered with exactly three fractional digits.
+  results corresponds to packets one to one; each entry has keys
+  at_ms, event_cursor, status, packet_id, path, hops, final_node,
+  ttl_remaining, reason in this order. event_cursor is the number of
+  events applied before the packet, i.e. the count of input events
+  whose at_ms is less than or equal to that packet's at_ms after all
+  events at the packet time have been applied.
+  status is "delivered" (reason null) or "dropped" (reason is the
+  unique drop cause). path lists the nodes actually reached; each
+  hop has keys from, to, link, ttl_before, ttl_after, decision in
+  this order, and decision is always "replay_event_route". An empty
+  packets array yields an empty results.
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3) for bad root fields, topology, events or
+  packet-entry structure, times or ordering, ParameterError
+  (exit code 2) for an undeclared source or destination, and
+  PacketError (exit code 4) for an invalid nested packet; stdout is
+  left empty with no partial results. All validation completes
+  before the replay begins.
+"""
+
 
 class ConfigError(Exception):
     """The input document is missing, malformed, or violates the schema."""
@@ -1811,6 +1891,65 @@ def validate_topology_events(document, node_ids, link_ids):
             )
         previous_at = at
         resolved.append((at, target_type, target, up))
+    return resolved
+
+
+def validate_replay_packets(document):
+    """Validate the packets field of replay-trace.
+
+    packets must be an array of at most 10000 entries, each with
+    exactly the fields at_ms and packet: at_ms is a decimal
+    millisecond string under the same format and range rules as
+    clock_ms and the entries must be ordered by non-decreasing
+    at_ms. The wrapper array, entry structure, time format, range
+    and ordering problems are ConfigError; the nested packet is
+    checked with exactly the trace packet rules, so every packet
+    problem (including a non-object packet value) is a PacketError.
+    Entries are checked in array order so the first reported problem
+    is deterministic. Returns a list of (at_ms in thousandths,
+    packet_id, ttl, priority, payload) in input order.
+    """
+    packets = document["packets"]
+    if not isinstance(packets, list):
+        raise ConfigError("packets must be an array")
+    if len(packets) > MAX_REPLAY_PACKETS:
+        raise ConfigError(
+            "too many packets: limit is %d" % MAX_REPLAY_PACKETS
+        )
+
+    resolved = []
+    previous_at = None
+    for pos, element in enumerate(packets):
+        where = "packets[%d]" % pos
+        if not isinstance(element, dict):
+            raise ConfigError("%s must be an object" % where)
+        if set(element) != set(REPLAY_PACKET_ENTRY_FIELDS):
+            raise ConfigError(
+                "%s must contain exactly the fields at_ms, packet" % where
+            )
+        at = parse_time_value(
+            element["at_ms"], MAX_CLOCK_THOUSANDTHS, "%s.at_ms" % where
+        )
+        if previous_at is not None and at < previous_at:
+            raise ConfigError(
+                "%s.at_ms is earlier than the previous packet" % where
+            )
+        previous_at = at
+        packet = element["packet"]
+        if not isinstance(packet, dict):
+            raise PacketError("%s.packet must be an object" % where)
+        if set(packet) != set(PACKET_FIELDS):
+            for name in PACKET_FIELDS:
+                if name not in packet:
+                    raise PacketError(
+                        "%s.packet missing field: %s" % (where, name)
+                    )
+            for name in sorted(k for k in packet if k not in PACKET_FIELDS):
+                raise PacketError(
+                    "%s.packet has unexpected field: %s" % (where, name)
+                )
+        packet_id, ttl, priority, payload = validate_packet_values(packet)
+        resolved.append((at, packet_id, ttl, priority, payload))
     return resolved
 
 
@@ -3185,6 +3324,156 @@ def topology_event_trace_packet(
     return output
 
 
+def replay_single_packet(
+    node_ids, links, source, destination, available, link_state,
+    at_thousandths, event_cursor, packet_id, ttl,
+):
+    """Trace one replay packet over the current effective topology.
+
+    available holds the current node availability after the events
+    already applied and link_state the current link up state. A link
+    participates exactly when its own state is up and both endpoint
+    nodes are available. Node down, immediate delivery, no_route and
+    ttl_exhausted are attributed exactly as in
+    topology_event_trace_packet; every hop is tagged with decision
+    "replay_event_route". Returns the per-packet result object with
+    keys at_ms, event_cursor, status, packet_id, path, hops,
+    final_node, ttl_remaining, reason.
+    """
+    source_id = node_ids[source]
+    destination_id = node_ids[destination]
+    result = {
+        "at_ms": format_ms(at_thousandths),
+        "event_cursor": event_cursor,
+        "status": None,
+        "packet_id": packet_id,
+        "path": [source_id],
+        "hops": [],
+        "final_node": source_id,
+        "ttl_remaining": ttl,
+        "reason": None,
+    }
+
+    if not available[source] or not available[destination]:
+        result["status"] = "dropped"
+        result["reason"] = "node_down"
+        return result
+
+    if source == destination:
+        result["status"] = "delivered"
+        return result
+
+    effective_links = [
+        (
+            link_id,
+            u,
+            v,
+            cost,
+            link_state[link_id] and available[u] and available[v],
+        )
+        for link_id, u, v, cost, _up in links
+    ]
+    route = find_route(node_ids, effective_links, source, destination)
+    if route is None:
+        result["status"] = "dropped"
+        result["reason"] = "no_route"
+        return result
+
+    path, route_links, _total_cost = route
+    remaining = ttl
+    for next_id, link_id in zip(path[1:], route_links):
+        if remaining <= 0:
+            result["status"] = "dropped"
+            result["reason"] = "ttl_exhausted"
+            result["ttl_remaining"] = remaining
+            return result
+        hop = {
+            "from": result["final_node"],
+            "to": next_id,
+            "link": link_id,
+            "ttl_before": remaining,
+            "ttl_after": remaining - 1,
+            "decision": "replay_event_route",
+        }
+        result["hops"].append(hop)
+        remaining -= 1
+        result["path"].append(next_id)
+        result["final_node"] = next_id
+
+    result["status"] = "delivered"
+    result["ttl_remaining"] = remaining
+    return result
+
+
+def replay_trace_packets(
+    node_ids, links, source, destination, events, packets
+):
+    """Replay topology events and many packets on one time line.
+
+    Every node starts available and every link starts in its declared
+    up state. Events and packet entries are non-decreasing in time;
+    before each packet, every event with at_ms less than or equal to
+    the packet time is applied in input order, so at any one time all
+    events are applied first and the packets then run in array order,
+    each affected only by events not later than itself. Each packet is
+    traced independently over the effective topology by
+    replay_single_packet; the applied event count before the packet is
+    reported as event_cursor.
+
+    Returns the output object with keys status, source, destination,
+    events, results. status is "replayed"; events are echoed in full
+    input order with at_ms rendered to three fractional digits, and
+    results correspond to the packets one to one.
+    """
+    available = [True] * len(node_ids)
+    node_index = {node_id: index for index, node_id in enumerate(node_ids)}
+    link_state = {link_id: up for link_id, _u, _v, _cost, up in links}
+
+    rendered_events = [
+        {
+            "at_ms": format_ms(at),
+            "target_type": target_type,
+            "target": target,
+            "up": up,
+        }
+        for at, target_type, target, up in events
+    ]
+
+    results = []
+    event_cursor = 0
+    event_count = len(events)
+    for at, packet_id, ttl, _priority, _payload in packets:
+        while event_cursor < event_count and events[event_cursor][0] <= at:
+            _at, target_type, target, up = events[event_cursor]
+            if target_type == TOPOLOGY_TARGET_NODE:
+                available[node_index[target]] = up
+            else:
+                link_state[target] = up
+            event_cursor += 1
+        results.append(
+            replay_single_packet(
+                node_ids,
+                links,
+                source,
+                destination,
+                available,
+                link_state,
+                at,
+                event_cursor,
+                packet_id,
+                ttl,
+            )
+        )
+
+    return {
+        "status": "replayed",
+        "source": node_ids[source],
+        "destination": node_ids[destination],
+        "events": rendered_events,
+        "results": results,
+    }
+
+
 def ecmp_candidate_table(node_ids, links, destination):
     """Minimum-cost candidate next hops for every node, keyed by distance.
 
@@ -3842,6 +4131,24 @@ def build_parser():
         metavar="PATH",
         help="path to the UTF-8 JSON fragment trace document",
     )
+    replay_parser = subparsers.add_parser(
+        "replay-trace",
+        help="replay topology events and many packets on one time line",
+        description=(
+            "Replay mixed node and link failure and recovery events "
+            "and many packets on one time line, applying every event "
+            "at each time before the packets at that time and tracing "
+            "each packet over the effective topology."
+        ),
+        epilog=REPLAY_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    replay_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON replay trace document",
+    )
     return parser
 
 
@@ -4158,6 +4465,19 @@ def main(argv):
                 ttl,
                 payload,
                 link_mtus,
+            )
+            write_json_line(sys.stdout, output)
+            return 0
+        if args.command == "replay-trace":
+            node_ids, links, source, destination = validate(
+                document, REPLAY_TRACE_ROOT_FIELDS
+            )
+            events = validate_topology_events(
+                document, node_ids, [link[0] for link in links]
+            )
+            packets = validate_replay_packets(document)
+            output = replay_trace_packets(
+                node_ids, links, source, destination, events, packets
             )
             write_json_line(sys.stdout, output)
             return 0
