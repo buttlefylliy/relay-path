@@ -23,6 +23,7 @@ Public entry points:
     python relay_path.py replay-trace --input PATH
     python relay_path.py replay-hop-summary --input PATH
     python relay_path.py replay-path-summary --input PATH
+    python relay_path.py replay-node-summary --input PATH
 
 Reads a UTF-8 JSON object describing relay nodes and directed links and
 prints the minimum-cost route from source to destination (route), an
@@ -75,7 +76,10 @@ each declared link was traversed across all packets
 (replay-hop-summary), or a replay that summarizes the same time line
 per full path, grouping packets by the events applied before them,
 their outcome and the exact node and link sequences they followed
-(replay-path-summary), as
+(replay-path-summary), or a replay that summarizes the same time
+line per node, counting visits, arrivals, departures, deliveries
+and drops for every declared node
+(replay-node-summary), as
 one compact JSON object on stdout.
 """
 
@@ -1201,6 +1205,58 @@ output (single compact JSON line on stdout, keys in this order):
   item in Unicode code point order), then status (delivered before
   dropped), then reason. An empty packets array yields an empty
   paths and zero counts everywhere.
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3), ParameterError (exit code 2) and
+  PacketError (exit code 4) exactly as in replay-trace; stdout is
+  left empty with no partial results. All validation completes
+  before the replay begins.
+"""
+
+REPLAY_NODE_SUMMARY_HELP = """\
+input format (UTF-8 JSON object with exactly these six fields):
+  nodes, links, source, destination, events, packets
+              exactly as in the replay-trace command; every topology,
+              endpoint, event and packet-entry constraint applies
+              unchanged, and an empty packets array is allowed.
+
+summary rules:
+  the time line is replayed exactly as in replay-trace: every node
+  starts available, every link starts in its declared up state, at
+  any one time every event at that time is applied first and the
+  packets at that time are then processed in array order, and each
+  packet is traced independently over the effective topology with
+  the topology-event-trace semantics (node_down checked before
+  source equal to destination, immediate delivery, no_route, ttl
+  decay and ttl_exhausted). Instead of reporting every packet, each
+  node actually reached by a packet's path adds one to that node's
+  visits; every successful hop adds one departure to its from node
+  and one arrival to its to node; a delivered packet adds one
+  delivered at its final node and a dropped packet adds one dropped
+  plus one to the matching drop reason at its final node. An
+  immediate delivery counts only one visit and one delivered; a
+  packet dropped before its first hop counts only the source; a
+  packet whose ttl runs out mid-way is attributed to the last node
+  it reached. Declared nodes that never participate still get an
+  all-zero record. Events later than every packet are still
+  echoed. Replaying never reads the wall clock.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, source, destination, events, packet_count,
+  delivered_count, dropped_count, drop_reasons, nodes
+  status is always "node_summarized". events echoes every input
+  event in input order, each with keys at_ms, target_type, target,
+  up in this order and at_ms rendered with exactly three fractional
+  digits. packet_count is the number of packet entries;
+  delivered_count and dropped_count sum to packet_count.
+  drop_reasons has keys node_down, no_route, ttl_exhausted in this
+  order, and the three integers sum to dropped_count. nodes holds
+  every declared node exactly once, ordered by node id in Unicode
+  code point order, each with keys node, visits, arrivals,
+  departures, delivered, dropped, drop_reasons in this order; the
+  inner drop_reasons again lists node_down, no_route and
+  ttl_exhausted in this order. An empty packets array yields zero
+  counts everywhere.
 
 errors (single compact JSON line on stderr, keys: error, message):
   ConfigError (exit code 3), ParameterError (exit code 2) and
@@ -3830,6 +3886,126 @@ def replay_path_summary(node_ids, links, source, destination, events, packets):
     }
 
 
+def replay_node_summary(node_ids, links, source, destination, events, packets):
+    """Replay the time line as in replay-trace and summarize per node.
+
+    The replay itself is identical to replay_trace_packets: every node
+    starts available, every link starts in its declared up state, at
+    any one time every event is applied before the packets at that
+    time, and each packet is traced independently over the effective
+    topology by replay_single_packet. Instead of keeping the per-hop
+    records, every node on a packet's path adds one visit, every
+    successful hop adds one departure at its from node and one arrival
+    at its to node, and the packet's final node adds one delivered or
+    one dropped plus the matching reason. Immediate delivery counts
+    only the one visit, a pre-first-hop drop counts only the source,
+    and a ttl_exhausted drop mid-way is attributed to the last reached
+    node. Declared nodes that never take part still get an all-zero
+    record.
+
+    Returns the output object with keys status, source, destination,
+    events, packet_count, delivered_count, dropped_count, drop_reasons,
+    nodes. status is "node_summarized"; events are echoed in full
+    input order with at_ms rendered to three fractional digits;
+    drop_reasons holds node_down, no_route and ttl_exhausted counts in
+    this order; nodes lists every declared node exactly once, ordered
+    by node id in Unicode code point order, each with keys node,
+    visits, arrivals, departures, delivered, dropped, drop_reasons
+    (the inner reasons again in the fixed order).
+    """
+    available = [True] * len(node_ids)
+    node_index = {node_id: index for index, node_id in enumerate(node_ids)}
+    link_state = {link_id: up for link_id, _u, _v, _cost, up in links}
+
+    rendered_events = [
+        {
+            "at_ms": format_ms(at),
+            "target_type": target_type,
+            "target": target,
+            "up": up,
+        }
+        for at, target_type, target, up in events
+    ]
+
+    reason_order = ("node_down", "no_route", "ttl_exhausted")
+    stats = {
+        node_id: {
+            "visits": 0,
+            "arrivals": 0,
+            "departures": 0,
+            "delivered": 0,
+            "dropped": 0,
+            "drop_reasons": {reason: 0 for reason in reason_order},
+        }
+        for node_id in node_ids
+    }
+    drop_reasons = {reason: 0 for reason in reason_order}
+    delivered_count = 0
+    dropped_count = 0
+    event_cursor = 0
+    event_count = len(events)
+    for at, packet_id, ttl, _priority, _payload in packets:
+        while event_cursor < event_count and events[event_cursor][0] <= at:
+            _at, target_type, target, up = events[event_cursor]
+            if target_type == TOPOLOGY_TARGET_NODE:
+                available[node_index[target]] = up
+            else:
+                link_state[target] = up
+            event_cursor += 1
+        result = replay_single_packet(
+            node_ids,
+            links,
+            source,
+            destination,
+            available,
+            link_state,
+            at,
+            event_cursor,
+            packet_id,
+            ttl,
+        )
+        if result["status"] == "delivered":
+            delivered_count += 1
+        else:
+            dropped_count += 1
+            drop_reasons[result["reason"]] += 1
+        for node_id in result["path"]:
+            stats[node_id]["visits"] += 1
+        for hop in result["hops"]:
+            stats[hop["from"]]["departures"] += 1
+            stats[hop["to"]]["arrivals"] += 1
+        final = result["final_node"]
+        if result["status"] == "delivered":
+            stats[final]["delivered"] += 1
+        else:
+            stats[final]["dropped"] += 1
+            stats[final]["drop_reasons"][result["reason"]] += 1
+
+    node_entries = [
+        {
+            "node": node_id,
+            "visits": stats[node_id]["visits"],
+            "arrivals": stats[node_id]["arrivals"],
+            "departures": stats[node_id]["departures"],
+            "delivered": stats[node_id]["delivered"],
+            "dropped": stats[node_id]["dropped"],
+            "drop_reasons": stats[node_id]["drop_reasons"],
+        }
+        for node_id in sorted(node_ids)
+    ]
+    return {
+        "status": "node_summarized",
+        "source": node_ids[source],
+        "destination": node_ids[destination],
+        "events": rendered_events,
+        "packet_count": len(packets),
+        "delivered_count": delivered_count,
+        "dropped_count": dropped_count,
+        "drop_reasons": drop_reasons,
+        "nodes": node_entries,
+    }
+
+
 def ecmp_candidate_table(node_ids, links, destination):
     """Minimum-cost candidate next hops for every node, keyed by distance.
 
@@ -4677,6 +4853,24 @@ def build_parser():
         metavar="PATH",
         help="path to the UTF-8 JSON replay trace document",
     )
+    replay_node_summary_parser = subparsers.add_parser(
+        "replay-node-summary",
+        help="replay the time line and summarize visits per node",
+        description=(
+            "Replay mixed node and link failure and recovery events "
+            "and many packets on one time line exactly as in "
+            "replay-trace, then summarize per node the visits, "
+            "arrivals, departures, deliveries and drops."
+        ),
+        epilog=REPLAY_NODE_SUMMARY_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    replay_node_summary_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON replay trace document",
+    )
     return parser
 
 
@@ -5036,6 +5230,19 @@ def main(argv):
             )
             packets = validate_replay_packets(document)
             output = replay_path_summary(
+                node_ids, links, source, destination, events, packets
+            )
+            write_json_line(sys.stdout, output)
+            return 0
+        if args.command == "replay-node-summary":
+            node_ids, links, source, destination = validate(
+                document, REPLAY_TRACE_ROOT_FIELDS
+            )
+            events = validate_topology_events(
+                document, node_ids, [link[0] for link in links]
+            )
+            packets = validate_replay_packets(document)
+            output = replay_node_summary(
                 node_ids, links, source, destination, events, packets
             )
             write_json_line(sys.stdout, output)
