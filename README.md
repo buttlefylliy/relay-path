@@ -166,6 +166,14 @@ TTL 衰减、到达时 ttl 为零仍送达、起终点相同时立即送达、`n
 
 成功时标准输出一行紧凑 JSON，顶层键依次为 `status`、`source`、`destination`、`events`、`packet_count`、`delivered_count`、`dropped_count`、`drop_reasons`、`links`。`status` 固定为 `summarized`；`events` 保持输入顺序完整回显，每项键依次为 `at_ms`、`target_type`、`target`、`up`，时间补足三位小数；`delivered_count` 与 `dropped_count` 之和等于 `packet_count`；`drop_reasons` 固定依次包含 `node_down`、`no_route`、`ttl_exhausted`，三项整数之和等于 `dropped_count`；`links` 包含每条已声明链路且只出现一次，按链路 id 的 Unicode 码点序排列，每项键依次为 `link`、`from`、`to`、`traversals`，端点保持声明值，`traversals` 为全部报文经过该链路的次数。空 `packets` 产生全零总数、原因和链路计数。相同输入逐字节一致，不读墙上时钟，不写文件；设事件数、报文数、节点数、链路数和成功跳数为 E、Q、N、M、H，时间上界为 O(E+Q(N+M)log(N+M)+H+MlogM)，除输出外额外内存为 O(E+N+M+Q+H)。既有命令的公开行为保持不变。
 
+### `replay-path-summary --input PATH`
+
+输入与 `replay-trace` 完全相同（`nodes`、`links`、`source`、`destination`、`events`、`packets` 六个字段，拒绝其他字段），全部拓扑、端点、事件与报文约束及错误分类不变：根字段、拓扑、事件与 `packets` 包装结构非法输出 `ConfigError`（退出码 3），未声明端点输出 `ParameterError`（退出码 2），嵌套 `packet` 非法输出 `PacketError`（退出码 4），出错时标准输出为空且无部分结果；拓扑、端点、全部事件和全部报文完整校验后才生成汇总。
+
+回放规则与 `replay-trace` 完全一致：各节点初始可用，各链路从声明的 `up` 状态开始，同一时刻先按数组顺序应用全部事件再按数组顺序处理该时刻的报文，每个报文只受不晚于自身时间的事件影响，并在当时有效拓扑上独立执行最小代价选路、状态覆盖、TTL 衰减与 `node_down`、`no_route`、`ttl_exhausted` 归因。不同之处在于不输出逐跳记录：每个报文由处理它之前已应用的事件数、最终状态与原因、实际到达的节点序列和成功经过的链路序列五项描述；仅当这五项全部相同的报文才合并为一个路径项并计数，平行链路因链路序列不同而绝不混组。晚到事件仍完整回显，空 `packets` 合法。
+
+成功时标准输出一行紧凑 JSON，顶层键依次为 `status`、`source`、`destination`、`events`、`packet_count`、`delivered_count`、`dropped_count`、`drop_reasons`、`paths`。`status` 固定为 `path_summarized`；`events` 保持输入顺序完整回显，每项键依次为 `at_ms`、`target_type`、`target`、`up`，时间补足三位小数；`delivered_count` 与 `dropped_count` 之和等于 `packet_count`；`drop_reasons` 固定依次包含 `node_down`、`no_route`、`ttl_exhausted`，三项整数之和等于 `dropped_count`；`paths` 每项依次包含 `event_cursor`、`status`、`reason`、`path`、`links`、`packet_count`：`event_cursor` 为处理该组报文前已应用的事件数，`path` 记录实际到达的节点序列，`links` 记录成功经过的链路序列，送达项 `reason` 为 null，丢弃项保留既有原因，`packet_count` 为组内报文数。`paths` 按 `event_cursor`、`path`、`links`、`status`（`delivered` 在前、`dropped` 在后）、`reason` 排序，序列按 Unicode 码点逐项比较。空 `packets` 产生空 `paths` 与全零计数。相同输入逐字节一致，不读墙上时钟，不写文件；设事件数、报文数、节点数、链路数、成功跳数和分组数为 E、Q、N、M、H、G，时间上界为 O(E+Q(N+M)log(N+M)+H+GlogG)，除输出外额外内存为 O(E+N+M+Q+H+G)。既有命令的公开行为保持不变。
+
 ## 状态
 
 仓库初始为空，功能按增量需求持续构建。
