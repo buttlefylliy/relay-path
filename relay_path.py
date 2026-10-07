@@ -4,6 +4,7 @@
 Public entry points:
 
     python relay_path.py route --input PATH
+    python relay_path.py explain-route --input PATH
     python relay_path.py trace --input PATH
     python relay_path.py ecmp-trace --input PATH
     python relay_path.py weighted-ecmp-trace --input PATH
@@ -22,7 +23,9 @@ Public entry points:
     python relay_path.py replay-trace --input PATH
 
 Reads a UTF-8 JSON object describing relay nodes and directed links and
-prints the minimum-cost route from source to destination (route), the
+prints the minimum-cost route from source to destination (route), an
+explanation of why every hop of that route was chosen over the other
+outgoing links (explain-route), the
 hop-by-hop forwarding trace of a packet along that route (trace), a
 trace that hashes the packet onto an equal-cost minimum-cost next hop at
 every node (ecmp-trace), or a trace that hashes the packet onto a
@@ -167,6 +170,45 @@ output (single compact JSON line on stdout, keys in this order):
 errors (single compact JSON line on stderr, keys: error, message):
   ConfigError (exit code 3) for unreadable/invalid input or bad schema;
   ParameterError (exit code 2) when source or destination is not declared.
+"""
+
+EXPLAIN_HELP = """\
+input format (UTF-8 JSON object with exactly these four fields):
+  nodes, links, source, destination
+              exactly as in the route command; all route constraints
+              on the topology apply unchanged
+
+explanation rules:
+  only the static topology is consulted; no packet, event or clock is
+  involved. The first six output keys are exactly the route result for
+  the same input. decisions lists one entry per node of path except
+  the destination, in path order; each entry has keys node,
+  chosen_link, chosen_to, remaining_cost, candidates in this order,
+  and remaining_cost is the minimum total cost from that node to the
+  destination. candidates lists every outgoing link of the node,
+  ordered by (next node id, link id) in Unicode code point order; each
+  candidate has keys link, to, link_cost, suffix_cost, total_cost,
+  outcome in this order. When the link is up and its target can reach
+  the destination, suffix_cost is the minimum cost from the target to
+  the destination and total_cost is link_cost plus suffix_cost;
+  otherwise both are null. outcome is one of selected (the link the
+  route actually takes), link_down (link not up), no_suffix_route
+  (target cannot reach the destination), higher_cost (total_cost above
+  remaining_cost) or tie_break_lost (equal total_cost but ordered
+  after the selected link by the route tie break). Every decision has
+  exactly one selected candidate, and chosen_link and chosen_to match
+  it. A source equal to its destination yields the zero-cost route
+  result with an empty decisions. When no route exists, decisions
+  holds only the source entry with chosen_link, chosen_to and
+  remaining_cost null, candidates classified as usual and no selected.
+
+output (single compact JSON line on stdout, keys in this order):
+  status, source, destination, path, links, total_cost, decisions
+  status is "found" or "unreachable", exactly as in route.
+
+errors (single compact JSON line on stderr, keys: error, message):
+  ConfigError (exit code 3) and ParameterError (exit code 2) as in
+  route. All validation completes before any result is produced.
 """
 
 TRACE_HELP = """\
@@ -2031,6 +2073,103 @@ def find_route(node_ids, links, source, destination):
     return [node_ids[i] for i in path_indices], path_links, dist[destination]
 
 
+def explain_route(node_ids, links, source, destination):
+    """Explain why every hop of the minimum-cost route was chosen.
+
+    Returns the output object with keys status, source, destination,
+    path, links, total_cost, decisions. The first six keys are exactly
+    the route result for the same input. Suffix costs come from one
+    Dijkstra from the destination over the reversed up-link graph, so
+    the equal-cost outgoing links of a node on the path are exactly the
+    feasible set the route walk picks from; the chosen link is the
+    first of them in (next node id, link id) order and every other
+    equal-cost link is a tie break loser.
+    """
+    node_count = len(node_ids)
+    outgoing = [[] for _ in range(node_count)]
+    reverse_adjacency = [[] for _ in range(node_count)]
+    for link_id, u, v, cost, up in links:
+        outgoing[u].append((link_id, v, cost, up))
+        if up:
+            reverse_adjacency[v].append((u, cost, link_id))
+
+    suffix = shortest_distances(node_count, reverse_adjacency, destination)
+
+    def decision_for(u, chosen_link, chosen_to):
+        remaining = suffix[u]
+        candidates = []
+        for link_id, v, cost, up in outgoing[u]:
+            if not up:
+                suffix_cost = None
+                total_cost = None
+                outcome = "link_down"
+            elif suffix[v] is None:
+                suffix_cost = None
+                total_cost = None
+                outcome = "no_suffix_route"
+            else:
+                suffix_cost = suffix[v]
+                total_cost = cost + suffix_cost
+                if remaining is not None and total_cost == remaining:
+                    outcome = "tie_break_lost"
+                else:
+                    outcome = "higher_cost"
+            candidates.append(
+                (node_ids[v], link_id, cost, suffix_cost, total_cost, outcome)
+            )
+        candidates.sort(key=lambda entry: (entry[0], entry[1]))
+        entries = []
+        for to_id, link_id, cost, suffix_cost, total_cost, outcome in candidates:
+            if link_id == chosen_link:
+                outcome = "selected"
+            entries.append(
+                {
+                    "link": link_id,
+                    "to": to_id,
+                    "link_cost": cost,
+                    "suffix_cost": suffix_cost,
+                    "total_cost": total_cost,
+                    "outcome": outcome,
+                }
+            )
+        return {
+            "node": node_ids[u],
+            "chosen_link": chosen_link,
+            "chosen_to": chosen_to,
+            "remaining_cost": remaining,
+            "candidates": entries,
+        }
+
+    route = find_route(node_ids, links, source, destination)
+    if route is None:
+        return {
+            "status": "unreachable",
+            "source": node_ids[source],
+            "destination": node_ids[destination],
+            "path": [],
+            "links": [],
+            "total_cost": None,
+            "decisions": [decision_for(source, None, None)],
+        }
+
+    path, route_links, total_cost = route
+    index_of = {node_id: pos for pos, node_id in enumerate(node_ids)}
+    decisions = []
+    for pos, link_id in enumerate(route_links):
+        decisions.append(
+            decision_for(index_of[path[pos]], link_id, path[pos + 1])
+        )
+    return {
+        "status": "found",
+        "source": node_ids[source],
+        "destination": node_ids[destination],
+        "path": path,
+        "links": route_links,
+        "total_cost": total_cost,
+        "decisions": decisions,
+    }
+
+
 def trace_packet(node_ids, links, source, destination, packet_id, ttl):
     """Forward a packet along the deterministic minimum-cost route.
 
@@ -3873,6 +4012,22 @@ def build_parser():
         metavar="PATH",
         help="path to the UTF-8 JSON routing document",
     )
+    explain_parser = subparsers.add_parser(
+        "explain-route",
+        help="explain why every hop of the route was chosen",
+        description=(
+            "Explain why every hop of the deterministic minimum-cost "
+            "route was chosen over the other outgoing links."
+        ),
+        epilog=EXPLAIN_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    explain_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="PATH",
+        help="path to the UTF-8 JSON routing document",
+    )
     trace_parser = subparsers.add_parser(
         "trace",
         help="trace a packet hop by hop toward the destination",
@@ -4479,6 +4634,11 @@ def main(argv):
             output = replay_trace_packets(
                 node_ids, links, source, destination, events, packets
             )
+            write_json_line(sys.stdout, output)
+            return 0
+        if args.command == "explain-route":
+            node_ids, links, source, destination = validate(document)
+            output = explain_route(node_ids, links, source, destination)
             write_json_line(sys.stdout, output)
             return 0
         node_ids, links, source, destination = validate(document)

@@ -20,6 +20,12 @@
 
 读取 UTF-8 JSON 拓扑文档（`nodes`、`links`、`source`、`destination`，拒绝其他字段），输出静态最小代价选路的一行紧凑 JSON。错误分类：`ConfigError`（退出码 3）、`ParameterError`（退出码 2）。
 
+### `explain-route --input PATH`
+
+输入与 `route` 完全相同（`nodes`、`links`、`source`、`destination` 四个字段，校验、错误分类与退出码不变），只解释静态拓扑，不引入报文、事件或时钟。成功时标准输出一行紧凑 JSON，顶层键依次为 `status`、`source`、`destination`、`path`、`links`、`total_cost`、`decisions`，前六项与 `route` 对同一输入的结果一致。
+
+`decisions` 按 `path` 中除终点外的节点排列，每项依次包含 `node`、`chosen_link`、`chosen_to`、`remaining_cost`、`candidates`；`remaining_cost` 是该节点到终点的最小总代价。`candidates` 收录该节点全部出链，按（目标节点 id、链路 id）的 Unicode 码点序排列，每项依次包含 `link`、`to`、`link_cost`、`suffix_cost`、`total_cost`、`outcome`：链路可用且目标节点可到终点时，`suffix_cost` 为目标节点到终点的最小代价，`total_cost` 为它与 `link_cost` 之和，否则二者均为 null。`outcome` 只能是 `selected`（实际选择）、`link_down`（链路不可用）、`no_suffix_route`（后缀不可达）、`higher_cost`（总代价更高）、`tie_break_lost`（等价但按 `route` 既有平局规则落选）；每项决策恰有一个 `selected`，`chosen_link` 与 `chosen_to` 与之对应。起点等于终点时返回 `route` 的零代价结果且 `decisions` 为空；无路可达时沿用 `route` 的 `unreachable` 结果，`decisions` 只含起点一项，三个决策值均为 null，候选照常分类且没有 `selected`。全部校验完成后才生成结果，相同输入逐字节一致；以终点为起点在反向图上做一次 Dijkstra 得到全部后缀代价，不枚举完整路径集合，时间上界 O((N+M)log(N+M))，除输出外额外内存 O(N+M)。既有命令的输入、输出、错误和键序保持不变。
+
 ### `trace --input PATH`
 
 在 route 的根字段之外增加 `packet`，拓扑约束与 route 完全一致。`packet` 仅含 `id`（非空、不超过 128 个 Unicode 码点）、`ttl`（整数 0–255）、`priority`（整数 0–7）、`payload`（UTF-8 编码后不超过 65536 字节）；布尔值不得冒充整数。packet 非法时标准错误输出 `PacketError`（键序 error、message），退出码 4，标准输出为空；全部校验完成后才开始追踪。
